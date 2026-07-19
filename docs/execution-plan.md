@@ -243,6 +243,17 @@ thinking loops exist.
 
 **Goal:** reproducible pin of PR #7.
 
+**HYBRID DECISION (owner-approved 2026-07-19):** recon
+(`.superpowers/sdd/necort-recon.md`) found PR #7's advertised specialist
+agents / 7-dim utility matrix / continuous-learning files are disconnected
+heuristic filler (never imported, zero LLM calls, invalid module filenames).
+The real working core is `NashEquilibriumRecursiveChat`
+(`recursive_thinking_ai.py` + `nash_recursive_thinking.py`). We vendor the
+submodule for the Nash core ONLY; the `enhanced-implementations/` files are
+NOT wired in. Specialist diversity comes from the manual specialist path
+(T13, promoted to first-class). T9–T11 and T13 below are written against
+this decision.
+
 - **Read `.superpowers/sdd/necort-recon.md` first** — the recon report on what
   PR #7 actually contains. If it contradicts this task, STOP and report
   BLOCKED with specifics.
@@ -265,37 +276,50 @@ thinking loops exist.
 **Goal:** all schema drift absorbed in one file.
 
 - Read `.superpowers/sdd/necort-recon.md` and the vendored source first.
-- `necort_adapter.py`: translate between our `Thought`/`SpecialistRound`/
-  `UtilityScore` schema and NECoRT's actual types (specialist results, utility
-  matrix, equilibrium state — whatever the real code exposes). Map NECoRT's
-  scoring dimensions onto our 7; document the mapping in the module docstring.
-- Adapter constructs NECoRT's inference client pointed at configured
-  endpoint(s) — must support an arbitrary OpenAI-compatible base URL. No
-  hardcoded providers.
-- Tests (TDD): adapter contract against a mocked NECoRT layer (schema
-  stability); a real-NECoRT test with a fake/local endpoint (no network),
-  skipped gracefully if vendored deps unavailable.
+- `necort_adapter.py` wraps `NashEquilibriumRecursiveChat` (the working core)
+  — per the HYBRID DECISION in Task 9. Required shims, WITHOUT modifying
+  vendored files (subclass and/or module-attribute injection only):
+  - fix the verified `NameError: datetime` crash (missing top-level import);
+  - override `_call_api`: configurable OpenAI-compatible `base_url` +
+    headers (no hardcoded OpenRouter), strip the OpenRouter-only `reasoning`
+    field;
+  - keep its blocking `requests` calls off the server's async event loop
+    (thread offload).
+- Translate the Nash core's rounds/alternatives/ratings/equilibrium state
+  into our `SpecialistRound[]` + `final_utility_scores{}` (7 dims); document
+  the mapping in the module docstring, including which of our dims the Nash
+  ratings can and cannot populate.
+- Tests (TDD): adapter contract against a mocked Nash layer (schema
+  stability); a real-vendored-code test with a fake/local endpoint (no
+  network), skipped gracefully if vendored deps unavailable; datetime-shim
+  regression test.
 
 ## Task 11: Subagent engine
 
-**Goal:** M3's engine — NECoRT behind our tool surface.
+**Goal:** M3's engine — the wrapped Nash core behind our tool surface, per
+the HYBRID DECISION in Task 9.
 
 - `subagent_engine.py` + tools (subagent-mode sessions only):
-  - `begin_subagent_thought(content?, prompt_focus?)` — constructs the NECoRT
-    invocation: compressed session context, stage-specific prompt template,
-    specialist list from config (stage weighting from T5 applied).
-  - `advance_subagent_round()` — next specialist in sequence (single
-    endpoint) or all concurrently (multiple endpoints configured).
+  - `begin_subagent_thought(content?, prompt_focus?)` — constructs the Nash
+    invocation via the T10 adapter: compressed session context,
+    stage-specific prompt template, specialist framings from config with T5
+    stage weighting injected into the alternative-generation prompts.
+  - `advance_subagent_round()` — next Nash round in sequence (single
+    endpoint) or alternatives generated concurrently (multiple endpoints).
   - `inspect_utility_matrix()` — current scoring state.
   - `commit_subagent_thought()` — accepts current equilibrium as committed.
   - Typical path `begin → commit` must work without the intermediate tools.
-- Convergence inside NECoRT (equilibrium threshold 0.75 from config); hard
-  round cap `subagent.max_rounds=2` enforced by US even if NECoRT wants more.
+- Convergence inside the Nash core (equilibrium threshold 0.75 from config);
+  hard round cap `subagent.max_rounds=2` enforced by US even if the core
+  wants more.
+- Endpoint required for this engine; if NO endpoint is configured, the
+  engine reports a directive payload pointing at the manual specialist path
+  (`[subagent] engine="manual"`, T13) instead of failing opaquely.
 - Sequential fallback when one endpoint configured — semantics identical,
   wall-clock longer.
 - Tests (TDD): full loop against mocked adapter; round-cap enforcement;
   sequential vs multi-endpoint dispatch; mode-gate rejection; begin→commit
-  short path.
+  short path; no-endpoint directive.
 
 ## Task 12: Finalize/move UX polish (M4)
 
@@ -320,12 +344,15 @@ thinking loops exist.
   `prompts.py` with the exact expected shape, never a raw error/traceback.
 - Audit all tool signatures: flat (no nested required objects); response
   templates short and directive.
-- `subagent_fallback` manual path (plan's open-decision recommendation for
-  M5): config `[subagent] engine="necort"|"manual"` **[derived name]**. In
-  manual mode the server hands the model each specialist's prompt template in
-  turn (the model plays the specialists itself); scoring collected via the
-  same utility schema; no NECoRT import required. This is the insurance
-  policy if a NECoRT re-pin breaks.
+- Manual specialist path — PROMOTED to first-class by the HYBRID DECISION
+  (Task 9), not mere insurance: config `[subagent] engine="necort"|"manual"`
+  **[derived name]**. In manual mode the server hands the calling model each
+  specialist's prompt template in turn (the model plays the specialists
+  itself — no endpoint, no network, no NECoRT import); the model submits
+  per-candidate scores on our 7-dim schema; the server runs the
+  deterministic Nash-style selection arithmetic over the submitted scores.
+  This is subagent mode's endpoint-free path AND the insurance policy if a
+  NECoRT re-pin breaks.
 - Tests: malformed-input matrix across all tools; plaintext roundtrip of the
   serial loop; manual-mode subagent loop end-to-end without vendored code.
 
