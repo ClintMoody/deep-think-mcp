@@ -15,7 +15,7 @@ from __future__ import annotations
 
 import uuid
 from datetime import datetime, timezone
-from typing import Literal
+from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -128,6 +128,16 @@ class Session(BaseModel):
     current_thought_id: str | None = None
     status: Literal["active", "finalized", "archived"] = "active"
     save_path: str = ""
+    # Raw per-session config overrides dict as passed to start_session(),
+    # e.g. {"serial": {"max_rounds": 1}} -- Global Constraints requires
+    # "all settings per-session-overridable via start_session args", but
+    # docs/build-plan.md's Data model section doesn't name a field for it.
+    # [derived structure, task 3]: persisted verbatim (not merged/resolved)
+    # so later engine tasks (7, 11) can feed it back through
+    # config.load_config(root, overrides=session.overrides) whenever they
+    # need this session's effective config, without re-deriving it from
+    # scratch or losing it between tool calls.
+    overrides: dict[str, Any] = Field(default_factory=dict)
     move_history: list[MoveRecord] = Field(default_factory=list)
     thoughts: list[Thought] = Field(default_factory=list)
     decisions: list[DecisionRecord] = Field(default_factory=list)

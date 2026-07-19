@@ -63,6 +63,7 @@ def test_session_defaults():
     assert session.status == "active"
     assert session.current_thought_id is None
     assert session.save_path == ""
+    assert session.overrides == {}
     assert session.move_history == []
     assert session.thoughts == []
     assert session.decisions == []
@@ -180,6 +181,7 @@ def test_session_roundtrip_serial_mode():
         current_stage="Analysis",
         current_thought_id=thought.id,
         save_path="/tmp/does-not-matter/session.json",
+        overrides={"serial": {"max_rounds": 1}},
         move_history=[
             MoveRecord(from_path="/old/path.json", to_path="/new/path.json")
         ],

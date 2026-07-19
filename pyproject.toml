@@ -26,3 +26,9 @@ dev = [
     "pytest>=9.1.1",
     "pytest-asyncio>=1.4.0",
 ]
+
+[tool.pytest.ini_options]
+# MCP contract tests (tests/test_server.py) drive the real SDK's in-memory
+# client, which is async. auto mode lets `async def test_...` functions run
+# without needing an explicit @pytest.mark.asyncio on every one.
+asyncio_mode = "auto"
