@@ -262,6 +262,31 @@ def move_failed(session_id: str, code: str, message: str) -> dict[str, Any]:
     }
 
 
+def move_index_update_failed(session: Session, error: str, index_path: Any) -> dict[str, Any]:
+    """The move itself succeeded and was verified -- `session.save_path`
+    below is real and truthful -- but the session index couldn't be
+    updated to match afterward, so `resume_session`/`list_sessions` may
+    still be pointing at the old (now-deleted) path for this session
+    until it's corrected.
+    """
+    return {
+        "session_id": session.id,
+        "status": session.status,
+        "new_path": session.save_path,
+        "error": "index_update_failed",
+        "index_path": str(index_path),
+        "message": (
+            f"The session file was moved to `{session.save_path}` and "
+            f"verified successfully, but the session index could not be "
+            f"updated afterward ({error}). The session's data is safe at "
+            "its new location, but resume_session/list_sessions may not "
+            "find it there until the index is corrected -- an operator "
+            f"can manually fix this session's `path` entry in "
+            f"`{index_path}`."
+        ),
+    }
+
+
 # ---------------------------------------------------------------------------
 # keep_here()
 # ---------------------------------------------------------------------------

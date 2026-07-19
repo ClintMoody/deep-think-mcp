@@ -157,12 +157,13 @@ def move(session: Session, new_path: str, *, force: bool = False) -> Session:
     requires of every mutation), reads it back to verify the write
     actually landed, and only then removes the original file.
 
-    Raises `MoveError` (never a raw OSError) if the destination fails
-    validation. `session` is only mutated (its `move_history` and
-    `save_path`) once validation has passed; if the write/verify step
-    itself fails, the mutation is rolled back before re-raising, so a
-    caller that doesn't catch the error can't accidentally persist a
-    session claiming to live somewhere the move never actually completed.
+    Raises `MoveError` (never a raw `OSError`/`ValueError`) if the
+    destination fails validation. `session` is only mutated (its
+    `move_history` and `save_path`) once validation has passed; if the
+    write/verify step itself fails, the mutation is rolled back before
+    re-raising, so a caller that doesn't catch the error can't
+    accidentally persist a session claiming to live somewhere the move
+    never actually completed.
     """
     current = Path(session.save_path).resolve()
     target = _resolve_destination(session, new_path)
@@ -173,8 +174,14 @@ def move(session: Session, new_path: str, *, force: bool = False) -> Session:
 
     try:
         store.save(session, target)
+        # `store.load` mirrors `store.save`'s own `.bak`-recovery contract:
+        # it can raise `OSError` (missing/unreadable file) just as easily
+        # as `ValueError` (invalid JSON, or a pydantic `ValidationError` --
+        # a `ValueError` subclass -- if the content it reads back doesn't
+        # parse as a `Session`). Both mean "the write didn't verifiably
+        # land," so both roll back the same way.
         written_ok = store.load(target) == session
-    except OSError as exc:
+    except (OSError, ValueError) as exc:
         session.move_history.pop()
         session.save_path = str(current)
         raise MoveError(

@@ -305,6 +305,35 @@ def test_move_rolls_back_mutation_when_write_fails(tmp_path, monkeypatch):
     assert os.path.exists(old_path)
 
 
+def test_move_rolls_back_mutation_when_verify_read_raises_value_error(tmp_path, monkeypatch):
+    """`store.load` can raise a `ValueError` (invalid JSON, or a pydantic
+    `ValidationError` -- a `ValueError` subclass -- from unparseable
+    content with no usable `.bak`) just as easily as an `OSError`. That
+    must roll back and raise `MoveError` exactly like an `OSError` does,
+    not propagate past `move()` as a raw `ValueError`.
+    """
+    session = _make_saved_session(tmp_path)
+    old_path = session.save_path
+    dest = tmp_path / "elsewhere" / "moved.json"
+    dest.parent.mkdir()
+
+    real_save = store.save
+
+    def _corrupt_load(path):
+        raise ValueError("invalid JSON, no usable .bak")
+
+    monkeypatch.setattr(store, "save", real_save)
+    monkeypatch.setattr(store, "load", _corrupt_load)
+
+    with pytest.raises(lifecycle.MoveError) as exc_info:
+        lifecycle.move(session, str(dest))
+
+    assert exc_info.value.code == "destination_write_failed"
+    assert session.move_history == []
+    assert session.save_path == old_path
+    assert os.path.exists(old_path)
+
+
 def test_move_rolls_back_mutation_when_verification_fails(tmp_path, monkeypatch):
     session = _make_saved_session(tmp_path)
     old_path = session.save_path

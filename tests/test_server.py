@@ -17,6 +17,7 @@ reuse must be proven now.
 
 from __future__ import annotations
 
+from pathlib import Path
 from typing import Any
 
 import pytest
@@ -658,3 +659,138 @@ async def test_move_session_survives_rename_being_unavailable(tmp_path, monkeypa
     assert payload["new_path"] == str(dest)
     assert dest.is_file()
     assert store.load(dest).id == session_id
+
+
+# ---------------------------------------------------------------------------
+# move_session: fault injection -- failures *after* the move itself has
+# completed and been verified (index update, verify-step re-read) must
+# degrade to a clean directive payload, never a raw traceback, and must
+# never claim a lie about where the session lives.
+# ---------------------------------------------------------------------------
+
+
+async def test_move_session_index_upsert_failure_returns_clean_payload_not_a_crash(
+    tmp_path, monkeypatch
+):
+    dest = tmp_path / "elsewhere" / "moved.json"
+    dest.parent.mkdir(parents=True)
+
+    srv = server.create_server(root=tmp_path)
+    async with create_connected_server_and_client_session(srv) as client:
+        started = await _call(client, "start_session", {"question": "q", "mode": "serial"})
+        session_id = started["session_id"]
+
+        def _boom(*args, **kwargs):
+            raise OSError("simulated portalocker lock timeout")
+
+        monkeypatch.setattr(server.index, "upsert", _boom)
+
+        payload = await _call(
+            client, "move_session", {"session_id": session_id, "new_path": str(dest)}
+        )
+
+    # The move itself must have actually completed and been verified --
+    # this payload has to be truthful, not just clean.
+    assert dest.is_file()
+    assert store.load(dest).id == session_id
+
+    assert payload["error"] == "index_update_failed"
+    assert payload["session_id"] == session_id
+    assert payload["new_path"] == str(dest)
+    assert str(tmp_path) in payload["index_path"]
+    assert str(dest) in payload["message"]
+
+
+async def test_move_session_returns_clean_payload_and_rolls_back_when_verify_read_raises(
+    tmp_path, monkeypatch
+):
+    dest = tmp_path / "elsewhere" / "moved.json"
+    dest.parent.mkdir(parents=True)
+
+    real_load = store.load
+    resolved_dest = dest.resolve()
+
+    def _flaky_load(path):
+        # Only explode for the verify-step re-read of the *destination*
+        # inside lifecycle.move(); the earlier _load_session() read of the
+        # session's *current* location must behave normally, or this test
+        # would never reach move_session's own logic at all.
+        if Path(path).resolve() == resolved_dest:
+            raise ValueError("corrupt content, no usable .bak")
+        return real_load(path)
+
+    srv = server.create_server(root=tmp_path)
+    async with create_connected_server_and_client_session(srv) as client:
+        started = await _call(client, "start_session", {"question": "q", "mode": "serial"})
+        session_id = started["session_id"]
+        original_path = store.session_path(tmp_path, session_id)
+
+        monkeypatch.setattr(server.store, "load", _flaky_load)
+        payload = await _call(
+            client, "move_session", {"session_id": session_id, "new_path": str(dest)}
+        )
+        monkeypatch.undo()  # restore real store.load before the calls below
+
+        resumed = await _call(client, "resume_session", {"session_id": session_id})
+
+    assert payload["error"] == "destination_write_failed"
+    assert payload["session_id"] == session_id
+
+    # Rolled back: the session must still be found, unmoved, at its
+    # original location -- not stranded claiming to live at `dest`.
+    assert resumed["save_path"] == str(original_path)
+    assert resumed["status"] == "active"
+    assert original_path.is_file()
+    session = store.load(original_path)
+    assert session.move_history == []
+
+
+# ---------------------------------------------------------------------------
+# move_session: two sequential moves through the real MCP tool surface --
+# move_history must accumulate every hop, and the index must always
+# resolve to wherever the session actually lives *now*, not an
+# intermediate stop.
+# ---------------------------------------------------------------------------
+
+
+async def test_move_session_twice_accumulates_move_history_and_index_tracks_final_path(
+    tmp_path,
+):
+    first_dest = tmp_path / "first-stop" / "moved.json"
+    first_dest.parent.mkdir(parents=True)
+    second_dest = tmp_path / "second-stop" / "moved-again.json"
+    second_dest.parent.mkdir(parents=True)
+
+    srv = server.create_server(root=tmp_path)
+    async with create_connected_server_and_client_session(srv) as client:
+        started = await _call(client, "start_session", {"question": "q", "mode": "serial"})
+        session_id = started["session_id"]
+        original_path = store.session_path(tmp_path, session_id)
+
+        first = await _call(
+            client,
+            "move_session",
+            {"session_id": session_id, "new_path": str(first_dest)},
+        )
+        second = await _call(
+            client,
+            "move_session",
+            {"session_id": session_id, "new_path": str(second_dest)},
+        )
+
+        resumed = await _call(client, "resume_session", {"session_id": session_id})
+        listed = await _call(client, "list_sessions")
+
+    assert first["new_path"] == str(first_dest)
+    assert second["new_path"] == str(second_dest)
+    assert not original_path.exists()
+    assert not first_dest.exists()
+    assert second_dest.is_file()
+
+    on_disk = store.load(second_dest)
+    assert [r.to_path for r in on_disk.move_history] == [str(first_dest), str(second_dest)]
+    assert [r.from_path for r in on_disk.move_history] == [str(original_path), str(first_dest)]
+
+    assert resumed["save_path"] == str(second_dest)
+    by_id = {s["id"]: s for s in listed["sessions"]}
+    assert by_id[session_id]["path"] == str(second_dest)

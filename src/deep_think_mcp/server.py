@@ -219,7 +219,20 @@ def _register_lifecycle_tools(mcp: FastMCP, data_root: Path) -> None:
             session = lifecycle.move(session, new_path, force=force)
         except lifecycle.MoveError as exc:
             return prompts.move_failed(session_id, exc.code, exc.message)
-        index.upsert(data_root, session)
+        # By this point the move itself is done and verified: the session
+        # file exists at its new path and `session` (including
+        # move_history/save_path) reflects it -- lifecycle.move() already
+        # persisted that. Only the index needs to catch up, and that's a
+        # separate write (lock contention, disk-full, permissions) that
+        # must not turn a successful move into a crashed tool call or a
+        # session the index still points at a now-deleted path. Catching
+        # broadly here is deliberate: any failure of this specific call
+        # (OSError, portalocker's LockException, ...) must degrade to a
+        # clean directive payload, never a raw traceback.
+        try:
+            index.upsert(data_root, session)
+        except Exception as exc:  # noqa: BLE001 -- see comment above
+            return prompts.move_index_update_failed(session, str(exc), index.index_path(data_root))
         return prompts.session_moved(session)
 
     @mcp.tool()
