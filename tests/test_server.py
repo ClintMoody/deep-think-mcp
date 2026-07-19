@@ -392,8 +392,8 @@ async def test_mode_gate_returns_not_found_for_unknown_session(tmp_path):
 
 
 # ---------------------------------------------------------------------------
-# create_server() tool surface: exactly the 9 lifecycle tools + Task 5's
-# advance_stage, no more
+# create_server() tool surface: the 9 lifecycle tools, Task 5's advance_stage,
+# and Task 7's six serial-engine thought tools -- no more
 # ---------------------------------------------------------------------------
 
 
@@ -414,6 +414,12 @@ async def test_create_server_registers_exactly_the_lifecycle_and_stage_tools(tmp
         "move_session",
         "keep_here",
         "advance_stage",
+        "begin_thought",
+        "critique_current_thought",
+        "submit_critique",
+        "refine_current_thought",
+        "score_current_thought",
+        "commit_thought",
     }
 
 

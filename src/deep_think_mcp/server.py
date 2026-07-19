@@ -35,7 +35,16 @@ from typing import Any, Callable, Literal
 
 from mcp.server.fastmcp import FastMCP
 
-from deep_think_mcp import config, index, lifecycle, prompts, stages, store
+from deep_think_mcp import (
+    config,
+    index,
+    lens_loader,
+    lifecycle,
+    prompts,
+    serial_engine,
+    stages,
+    store,
+)
 from deep_think_mcp.session import Session
 
 SERVER_NAME = "deep-think-mcp"
@@ -59,25 +68,37 @@ def _load_session(
 
 def mode_gate(
     data_root: Path | str,
+    require_mode: Literal["serial", "subagent"] | None = None,
 ) -> Callable[[Callable[..., dict[str, Any]]], Callable[..., dict[str, Any]]]:
-    """Decorator factory enforcing the mode-selection contract centrally.
+    """Decorator factory enforcing the mode contract centrally.
 
     Apply to any "thought tool" whose first parameter is `session_id: str`
     (the convention every tool in `docs/build-plan.md` § "Thought loop"
     follows), *underneath* `@mcp.tool()`:
 
         @mcp.tool()
-        @mode_gate(data_root)
+        @mode_gate(data_root, require_mode="serial")
         def begin_thought(session_id: str, content: str) -> dict[str, Any]:
             ...
 
-    Before the wrapped function ever runs: looks the session up (returning
-    a `session_not_found` payload if unknown), then checks `session.mode`.
-    If it's still `None`, short-circuits with a directive payload pointing
-    at `set_session_mode` -- the wrapped function never executes. This is
-    the single enforcement point Tasks 7 (serial engine) and 11 (subagent
-    engine) are expected to route every thought-loop tool through, so the
-    gate only has to be right once.
+    Before the wrapped function ever runs it looks the session up (returning
+    a `session_not_found` payload if unknown), then enforces two distinct
+    conditions the gate deliberately keeps separate:
+
+      1. *No mode yet* (`session.mode is None`): short-circuits with the
+         `mode_required` directive pointing at `set_session_mode`. This is
+         the Task 3 contract, applied to every thought tool for free.
+      2. *Wrong mode* (`require_mode` set and `session.mode != require_mode`):
+         short-circuits with the `wrong_mode` directive. This is Task 7's
+         addition -- the original gate only handled case 1, so it is
+         extended here (minimally, backward-compatibly) rather than adding a
+         separate per-tool guard: `require_mode=None` preserves the exact
+         old behavior for `advance_stage` and any non-mode-specific tool,
+         while serial tools pass `require_mode="serial"` and Task 11's
+         subagent tools will pass `require_mode="subagent"`. Keeping both
+         checks in the one gate means "no mode" vs "wrong mode" stay two
+         clearly different directives, and every future engine tool inherits
+         both for free.
 
     `functools.wraps` preserves the wrapped function's real signature
     (verified against the SDK: FastMCP's schema introspection follows
@@ -94,6 +115,13 @@ def mode_gate(
                 return error
             if session.mode is None:
                 return prompts.mode_required(session_id, blocked_tool=fn.__name__)
+            if require_mode is not None and session.mode != require_mode:
+                return prompts.wrong_mode(
+                    session_id,
+                    required_mode=require_mode,
+                    current_mode=session.mode,
+                    blocked_tool=fn.__name__,
+                )
             return fn(session_id, *args, **kwargs)
 
         return wrapper
@@ -289,6 +317,144 @@ def _register_stage_tools(mcp: FastMCP, data_root: Path) -> None:
         return prompts.stage_advanced(session)
 
 
+def _register_serial_tools(mcp: FastMCP, data_root: Path) -> None:
+    """Register Task 7's six serial-engine thought tools (Layer 4, serial
+    mode). Each is gated by `mode_gate(data_root, require_mode="serial")`:
+    a session with no mode gets the `mode_required` directive, a
+    subagent-mode session gets the `wrong_mode` directive, and neither ever
+    reaches the engine. The loop logic lives in `serial_engine.py`; these
+    wrappers only load the session, call the engine, map any
+    `SerialSequencingError` to a directive payload (never a raw error), and
+    -- on success -- persist and format the result via `prompts.py`. This is
+    the same load/mutate/persist division `_register_stage_tools` follows.
+    """
+
+    def _persist(session: Session) -> None:
+        store.save(session, session.save_path)
+        index.upsert(data_root, session)
+
+    def _cfg(session: Session) -> dict[str, Any]:
+        return config.load_config(root=data_root, overrides=session.overrides)
+
+    @mcp.tool()
+    @mode_gate(data_root, require_mode="serial")
+    def begin_thought(
+        session_id: str,
+        content: str,
+        tags: list[str] | None = None,
+        axioms: list[str] | None = None,
+    ) -> dict[str, Any]:
+        """Draft a new thought in the session's current stage. Fails with a
+        directive if a thought is already in progress (commit it first).
+        """
+        session, error = _load_session(data_root, session_id)
+        if error is not None:
+            return error
+        try:
+            thought = serial_engine.begin_thought(session, content, tags, axioms)
+        except serial_engine.SerialSequencingError as exc:
+            return prompts.serial_directive(session_id, exc.code, **exc.detail)
+        _persist(session)
+        return prompts.thought_begun(session, thought)
+
+    @mcp.tool()
+    @mode_gate(data_root, require_mode="serial")
+    def critique_current_thought(
+        session_id: str, lens: str | None = None
+    ) -> dict[str, Any]:
+        """Open a critique round and return the lens template to apply. Omit
+        `lens` to let the server pick a stage-appropriate one and rotate
+        through the library. The response places the current draft content
+        immediately before the lens template (adjacency contract).
+        """
+        session, error = _load_session(data_root, session_id)
+        if error is not None:
+            return error
+        available = lens_loader.discover_lenses(data_root)
+        try:
+            prompt = serial_engine.start_critique(
+                session, lens, available, _cfg(session)
+            )
+        except serial_engine.SerialSequencingError as exc:
+            return prompts.serial_directive(session_id, exc.code, **exc.detail)
+        _persist(session)
+        return prompts.critique_ready(session_id, prompt)
+
+    @mcp.tool()
+    @mode_gate(data_root, require_mode="serial")
+    def submit_critique(session_id: str, text: str) -> dict[str, Any]:
+        """Record the critique produced by applying the current lens."""
+        session, error = _load_session(data_root, session_id)
+        if error is not None:
+            return error
+        try:
+            rnd = serial_engine.submit_critique(session, text)
+        except serial_engine.SerialSequencingError as exc:
+            return prompts.serial_directive(session_id, exc.code, **exc.detail)
+        _persist(session)
+        return prompts.critique_submitted(session_id, rnd.round_index, rnd.lens)
+
+    @mcp.tool()
+    @mode_gate(data_root, require_mode="serial")
+    def refine_current_thought(
+        session_id: str,
+        new_content: str,
+        challenged_assumptions: list[str] | None = None,
+    ) -> dict[str, Any]:
+        """Rewrite the thought to address the critique. The server records
+        the new version and its normalized edit distance vs. the prior one.
+        """
+        session, error = _load_session(data_root, session_id)
+        if error is not None:
+            return error
+        try:
+            rnd, edit_distance = serial_engine.refine_current_thought(
+                session, new_content, challenged_assumptions
+            )
+        except serial_engine.SerialSequencingError as exc:
+            return prompts.serial_directive(session_id, exc.code, **exc.detail)
+        _persist(session)
+        return prompts.thought_refined(session_id, rnd.round_index, edit_distance)
+
+    @mcp.tool()
+    @mode_gate(data_root, require_mode="serial")
+    def score_current_thought(
+        session_id: str, scores: dict[str, Any] | None = None
+    ) -> dict[str, Any]:
+        """Self-score the refined thought across the 7 utility dimensions
+        (partial input is tolerated -- missing dims carry forward). Returns
+        the convergence verdict: whether to commit or run another lens.
+        """
+        session, error = _load_session(data_root, session_id)
+        if error is not None:
+            return error
+        try:
+            result = serial_engine.score_current_thought(
+                session, scores or {}, _cfg(session)
+            )
+        except serial_engine.SerialSequencingError as exc:
+            return prompts.serial_directive(session_id, exc.code, **exc.detail)
+        _persist(session)
+        return prompts.thought_scored(session_id, result)
+
+    @mcp.tool()
+    @mode_gate(data_root, require_mode="serial")
+    def commit_thought(session_id: str) -> dict[str, Any]:
+        """Lock the current thought (writing its final refined content back
+        as the thought's content) and clear the current-thought cursor.
+        Fails with a directive if no critique round has completed yet.
+        """
+        session, error = _load_session(data_root, session_id)
+        if error is not None:
+            return error
+        try:
+            thought = serial_engine.commit_thought(session)
+        except serial_engine.SerialSequencingError as exc:
+            return prompts.serial_directive(session_id, exc.code, **exc.detail)
+        _persist(session)
+        return prompts.thought_committed(session, thought)
+
+
 def create_server(root: Path | str | None = None) -> FastMCP:
     """Build a fresh `deep-think-mcp` FastMCP server instance.
 
@@ -301,6 +467,7 @@ def create_server(root: Path | str | None = None) -> FastMCP:
     mcp = FastMCP(SERVER_NAME)
     _register_lifecycle_tools(mcp, data_root)
     _register_stage_tools(mcp, data_root)
+    _register_serial_tools(mcp, data_root)
     return mcp
 
 

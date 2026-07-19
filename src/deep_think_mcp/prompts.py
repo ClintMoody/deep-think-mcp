@@ -16,9 +16,12 @@ tool (Tasks 4, 7, 8, 11, ...) that needs the same wording.
 
 from __future__ import annotations
 
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
-from deep_think_mcp.session import Session
+from deep_think_mcp.session import Session, Thought
+
+if TYPE_CHECKING:
+    from deep_think_mcp.serial_engine import CritiquePrompt, ScoreResult
 
 # ---------------------------------------------------------------------------
 # Mode descriptions -- single source of truth for list_modes() and every
@@ -327,3 +330,235 @@ def final_stage_reached(session: Session) -> dict[str, Any]:
             "when this session's reasoning is complete."
         ),
     }
+
+
+# ---------------------------------------------------------------------------
+# Wrong-mode directive -- Task 7's mode gate. A serial tool called on a
+# subagent-mode session (or vice versa in Task 11) never runs; the model is
+# told which mode this session is fixed in and to use that mode's tools.
+# ---------------------------------------------------------------------------
+
+
+def wrong_mode(
+    session_id: str, required_mode: str, current_mode: str, blocked_tool: str
+) -> dict[str, Any]:
+    return {
+        "session_id": session_id,
+        "error": "wrong_mode",
+        "required_mode": required_mode,
+        "current_mode": current_mode,
+        "blocked_tool": blocked_tool,
+        "message": (
+            f"'{blocked_tool}' is a {required_mode}-mode tool, but this "
+            f"session is in '{current_mode}' mode (fixed for the life of the "
+            f"session). Use the {current_mode}-mode tools instead, or start a "
+            f"new session in {required_mode} mode."
+        ),
+    }
+
+
+# ---------------------------------------------------------------------------
+# Task 7: the serial critique-lens loop. Success payloads first, then the
+# out-of-order sequencing directives (serial_directive), which turn a
+# weak-model mistake into "here is the exact next call", never an error.
+# ---------------------------------------------------------------------------
+
+
+def thought_begun(session: Session, thought: Thought) -> dict[str, Any]:
+    return {
+        "session_id": session.id,
+        "thought_id": thought.id,
+        "stage": thought.stage,
+        "position": thought.position,
+        "next_tool": "critique_current_thought",
+        "message": (
+            "Draft recorded. Now stress-test it: call "
+            "critique_current_thought(session_id) to get a critique lens "
+            "(omit `lens` to let the server pick a stage-appropriate one)."
+        ),
+    }
+
+
+def critique_ready(session_id: str, prompt: CritiquePrompt) -> dict[str, Any]:
+    """The critique payload. The lens templates open with a positional claim
+    ("the draft thought above"), so `draft_content` MUST sit immediately
+    before `lens_template` here -- the model reads the draft, then the
+    template that critiques it, with nothing in between. This ordering is
+    the adjacency contract from Task 6's review; `test_prompts` and the MCP
+    contract test both pin it.
+    """
+    return {
+        "session_id": session_id,
+        "thought_id": prompt.thought_id,
+        "lens": prompt.lens,
+        "round_index": prompt.round_index,
+        "draft_content": prompt.draft_content,
+        "lens_template": prompt.lens_template,
+        "next_tool": "submit_critique",
+        "message": (
+            "Apply the critique lens template to the draft content shown "
+            "immediately above it, then return your critique via "
+            "submit_critique(session_id, text)."
+        ),
+    }
+
+
+def critique_submitted(session_id: str, round_index: int, lens: str) -> dict[str, Any]:
+    return {
+        "session_id": session_id,
+        "round_index": round_index,
+        "lens": lens,
+        "next_tool": "refine_current_thought",
+        "message": (
+            "Critique recorded. Now rewrite the thought to address it: call "
+            "refine_current_thought(session_id, new_content)."
+        ),
+    }
+
+
+def thought_refined(
+    session_id: str, round_index: int, edit_distance: float
+) -> dict[str, Any]:
+    return {
+        "session_id": session_id,
+        "round_index": round_index,
+        "edit_distance": edit_distance,
+        "next_tool": "score_current_thought",
+        "message": (
+            "Refinement recorded (normalized edit distance vs. the prior "
+            f"version: {edit_distance:.3f}). Now self-score the refined "
+            "thought across the 7 utility dimensions via "
+            "score_current_thought(session_id, scores)."
+        ),
+    }
+
+
+def thought_scored(session_id: str, result: ScoreResult) -> dict[str, Any]:
+    """The convergence verdict. `converged`/`converged_reason` tell the model
+    outright whether to commit or run another critique lens -- directive, per
+    the local-model philosophy (the model shouldn't have to infer it).
+    """
+    if result.converged:
+        message = (
+            f"Converged ({result.converged_reason}). This thought is done -- "
+            "call commit_thought(session_id) to lock it."
+        )
+        next_tool = "commit_thought"
+    else:
+        message = (
+            "Not yet converged -- the thought is still improving. Run another "
+            "critique lens: call critique_current_thought(session_id) "
+            "(omit `lens` to rotate to the next one automatically)."
+        )
+        next_tool = "critique_current_thought"
+    return {
+        "session_id": session_id,
+        "round_index": result.round_index,
+        "scores": result.scores,
+        "overall": result.overall,
+        "delta": result.delta,
+        "converged": result.converged,
+        "converged_reason": result.converged_reason,
+        "next_tool": next_tool,
+        "message": message,
+    }
+
+
+def thought_committed(session: Session, thought: Thought) -> dict[str, Any]:
+    return {
+        "session_id": session.id,
+        "thought_id": thought.id,
+        "stage": thought.stage,
+        "position": thought.position,
+        "committed": True,
+        # Two legitimate next steps (another thought in this stage, or move
+        # on): point at the more common one and spell out both. Once Task 8
+        # lands, next_action() becomes the authoritative resolver of this
+        # fork; until then both named tools already exist and work.
+        "next_tool": "begin_thought",
+        "message": (
+            f"Thought committed at '{thought.stage}' position "
+            f"{thought.position}. Start another thought in this stage with "
+            "begin_thought(session_id, content), or move on with "
+            "advance_stage(session_id) when the stage is done."
+        ),
+    }
+
+
+# Per-code directive wording for out-of-order serial calls. Each entry is
+# (next_tool, message) -- the exact call the model should make instead.
+_SERIAL_DIRECTIVES: dict[str, tuple[str, str]] = {
+    "begin_first": (
+        "begin_thought",
+        "No thought is in progress. Draft one first with "
+        "begin_thought(session_id, content).",
+    ),
+    "uncommitted_exists": (
+        "commit_thought",
+        "A thought is already in progress in this stage. Finish it -- keep "
+        "refining and scoring it, then commit_thought(session_id) -- before "
+        "beginning a new one.",
+    ),
+    "need_critique": (
+        "critique_current_thought",
+        "No critique round is open. Open one with "
+        "critique_current_thought(session_id) first.",
+    ),
+    "need_submit": (
+        "submit_critique",
+        "You opened a critique lens but haven't submitted the critique yet. "
+        "Call submit_critique(session_id, text).",
+    ),
+    "empty_critique": (
+        "submit_critique",
+        "The critique text was empty. Submit an actual critique via "
+        "submit_critique(session_id, text).",
+    ),
+    "need_refine": (
+        "refine_current_thought",
+        "Rewrite the thought to address the critique before scoring: call "
+        "refine_current_thought(session_id, new_content).",
+    ),
+    "empty_refinement": (
+        "refine_current_thought",
+        "The refined content was empty. Provide the improved thought text via "
+        "refine_current_thought(session_id, new_content).",
+    ),
+    "need_score": (
+        "score_current_thought",
+        "Score the refined thought to finish this round: call "
+        "score_current_thought(session_id, scores).",
+    ),
+    "zero_rounds": (
+        "critique_current_thought",
+        "A thought must survive at least one critique round before it can be "
+        "committed. Start one with critique_current_thought(session_id).",
+    ),
+    "unknown_lens": (
+        "critique_current_thought",
+        "That lens name isn't in the library. Retry "
+        "critique_current_thought(session_id, lens) with one of the available "
+        "lenses (or omit `lens` to let the server pick).",
+    ),
+}
+
+
+def serial_directive(session_id: str, code: str, **detail: Any) -> dict[str, Any]:
+    """Map a `serial_engine.SerialSequencingError` code to a directive
+    payload. Unknown codes degrade to a generic 'call next_action' nudge
+    rather than raising -- a directive is never allowed to become an error.
+    """
+    next_tool, message = _SERIAL_DIRECTIVES.get(
+        code,
+        ("next_action", "Call next_action(session_id) to get the right next step."),
+    )
+    payload: dict[str, Any] = {
+        "session_id": session_id,
+        "error": "sequencing",
+        "code": code,
+        "next_tool": next_tool,
+        "message": message,
+    }
+    if code == "unknown_lens" and "lenses" in detail:
+        payload["available_lenses"] = detail["lenses"]
+    return payload

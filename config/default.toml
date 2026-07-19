@@ -23,6 +23,12 @@ default_prompt_user = true
 [serial]
 max_rounds = 3
 score_threshold = 0.05
+# Normalized edit distance (0.0 = identical, 1.0 = totally different) below
+# which a refinement is treated as a fixed point: the critique produced no
+# meaningful change, so the serial loop converges and commits. Default 0.05
+# is [derived] per docs/execution-plan.md Task 7 ("< epsilon (default 0.05,
+# configurable)"). Computed with stdlib difflib.SequenceMatcher (no new deps).
+edit_distance_epsilon = 0.05
 fast_mode = false
 # Full critique lens library (see src/deep_think_mcp/lenses/, added in a
 # later task); serial mode rotates through these per round.
