@@ -197,9 +197,17 @@ thinking loops exist.
 
 **Goal:** M2's core — the critique-lens loop with convergence.
 
+- **[derived — T3 review resolution]** Every thought-loop tool takes
+  `session_id` as its first parameter. The build plan's signature sketch
+  omits it but defines no current-session mechanism; explicit ids are more
+  directive for weak local models and are what the central `mode_gate`
+  (server.py, T3) requires of every gated tool. Applies to T7, T11, and T13
+  tools alike. If a gated tool must be `async def` (possible in T11),
+  `mode_gate` must first be extended to support async wrapped functions —
+  currently it is sync-only.
 - `serial_engine.py` + tools (serial-mode sessions only; subagent sessions get
   a directive rejection):
-  - `begin_thought(content, tags?, axioms?)`
+  - `begin_thought(session_id, content, tags?, axioms?)`
   - `critique_current_thought(lens)` — returns the lens template (server picks
     a stage-appropriate lens if `lens` omitted **[derived]**)
   - `submit_critique(text)`
