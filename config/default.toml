@@ -1,0 +1,63 @@
+# deep-think-mcp packaged defaults.
+#
+# This file is the base layer of the config stack:
+#   packaged defaults (this file) < user config (<root>/config.toml) < per-session overrides
+#
+# Values here are copied verbatim to <root>/config.toml by config.bootstrap()
+# the first time a data root is initialized. Editing that copy customizes a
+# given install; this file only changes the shipped defaults.
+
+[store]
+# Data root. Overridden by the DEEP_THINK_HOME environment variable, which
+# always wins regardless of what's configured here. See config.resolve_root().
+root = "~/deep-think-mcp"
+# Both paths below are resolved relative to [store].root.
+sessions_dir = "sessions"
+index_path = "index.json"
+
+[modes]
+# Server always asks the user to pick a mode via start_session's
+# mode-required payload, even when a default is configured here.
+default_prompt_user = true
+
+[serial]
+max_rounds = 3
+score_threshold = 0.05
+fast_mode = false
+# Full critique lens library (see src/deep_think_mcp/lenses/, added in a
+# later task); serial mode rotates through these per round.
+default_lenses = [
+    "overconfidence",
+    "weak_evidence",
+    "missing_perspective",
+    "unstated_assumption",
+    "scope_creep",
+    "alternative_framing",
+    "steel_man",
+    "first_principles",
+]
+
+[subagent]
+max_rounds = 2
+equilibrium_threshold = 0.75
+# TODO(T9): placeholder pending NECoRT PR #7 recon — replace with the
+# specialist roster PR #7 actually ships once vendored.
+agents = ["Analysis", "Creativity"]
+sequential_fallback = true
+
+[stages]
+default = [
+    "Problem Definition",
+    "Research",
+    "Analysis",
+    "Synthesis",
+    "Conclusion",
+]
+
+[autopilot]
+enabled = false
+endpoint = "http://localhost:11434/v1"
+model = "qwen2.5:14b"
+# No explicit default given in docs/build-plan.md; 0.7 is a reasonable
+# general-purpose default, off by default since autopilot.enabled = false.
+temperature = 0.7
