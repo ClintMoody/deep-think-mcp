@@ -13,8 +13,10 @@ it silently depends on something that was never said out loud.
   "scalable") where the definition chosen quietly decides the outcome.
 - Context taken for granted (budget, timeline, audience, environment,
   constraints) that was never confirmed, only assumed.
-- An assumption imported from a similar-but-different situation and applied
-  here without checking it still holds.
+- A priority or trade-off assumed without being named (e.g. assuming speed
+  matters more than cost, or that convenience outweighs risk) -- the
+  thought never states it's making that trade-off, but the conclusion
+  flips if the priority is reversed.
 
 ## What to produce
 

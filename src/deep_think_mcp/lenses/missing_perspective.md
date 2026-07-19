@@ -13,8 +13,11 @@ it.
 - A relevant expert domain (technical, legal, ethical, financial, cultural,
   ...) that would evaluate this differently, and is absent from the
   thought.
-- The thought only argues from the framing it started with, never asking
-  "how would someone who disagrees with the premise see this?"
+- Someone with direct, on-the-ground experience of how this plays out in
+  practice (a front-line worker, an end user, someone who has actually
+  lived through the situation) whose practical knowledge is absent --
+  distinct from formal expertise, this is about what firsthand experience
+  would know that isn't in the thought.
 - Second-order effects on people or systems not in the room for this
   reasoning.
 

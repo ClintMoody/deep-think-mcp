@@ -14,7 +14,7 @@ the real home directory -- every `root` used here is an explicit tmp_path.
 
 from __future__ import annotations
 
-from deep_think_mcp import config, lens_loader
+from deep_think_mcp import config, lens_loader, stages
 
 BUNDLED_LENS_NAMES = {
     "overconfidence",
@@ -52,6 +52,15 @@ def test_discover_lenses_names_match_config_default_lenses():
     # never drift apart.
     defaults = config.load_defaults()
     assert set(defaults["serial"]["default_lenses"]) == BUNDLED_LENS_NAMES
+
+    # stages.SERIAL_LENS_DEFAULTS maps stage -> [lens names], not a flat
+    # set of all 8 -- every lens name it references must still resolve to
+    # something the loader actually discovers.
+    discovered = lens_loader.discover_lenses()
+    referenced_by_stages = {
+        lens for lenses in stages.SERIAL_LENS_DEFAULTS.values() for lens in lenses
+    }
+    assert referenced_by_stages <= set(discovered)
 
 
 def test_discover_lenses_with_no_root_ignores_any_user_dir():
