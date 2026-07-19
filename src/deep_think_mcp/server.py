@@ -20,6 +20,11 @@ None returns a directive payload") must be enforced *centrally*, not
 per-tool, so those later tasks inherit it for free instead of re-deriving
 it. `mode_gate` is that reusable enforcement point -- see its docstring for
 the exact usage contract engine tasks are expected to follow.
+
+Task 5 adds Layer 3 (the stage machine)'s one tool, `advance_stage`. Its
+cursor logic lives in `stages.py`; this module only registers the tool,
+gated by `mode_gate` -- see `_register_stage_tools` for why a stage-machine
+tool, not a thought-loop tool, is gated the same way.
 """
 
 from __future__ import annotations
@@ -30,7 +35,7 @@ from typing import Any, Callable, Literal
 
 from mcp.server.fastmcp import FastMCP
 
-from deep_think_mcp import config, index, lifecycle, prompts, store
+from deep_think_mcp import config, index, lifecycle, prompts, stages, store
 from deep_think_mcp.session import Session
 
 SERVER_NAME = "deep-think-mcp"
@@ -249,6 +254,41 @@ def _register_lifecycle_tools(mcp: FastMCP, data_root: Path) -> None:
         return prompts.session_kept(session)
 
 
+def _register_stage_tools(mcp: FastMCP, data_root: Path) -> None:
+    """Register Layer 3's one tool: `advance_stage`.
+
+    Gated by `mode_gate`, like every future thought-loop tool (Tasks 7,
+    11) -- even though `advance_stage` isn't itself a thought tool. This
+    is a Task 5 judgment call the brief doesn't spell out: a session with
+    `mode is None` has no engine to hand its committed thoughts to yet, so
+    "which stage are we reasoning in" has no meaningful answer either --
+    gating it keeps the mode-required directive the very first thing a
+    caller sees for *any* session-state-progressing tool, not just the
+    ones that happen to exist already. See `.superpowers/sdd/task-5-
+    report.md` for the full reasoning, flagged there for reviewer
+    sign-off.
+    """
+
+    @mcp.tool()
+    @mode_gate(data_root)
+    def advance_stage(session_id: str) -> dict[str, Any]:
+        """Advance the session's stage cursor to the next stage in its
+        `expected_stages`. Fails cleanly with a directive payload pointing
+        at `finalize_session` if the session is already at its final
+        stage -- there is nowhere further to advance to.
+        """
+        session, error = _load_session(data_root, session_id)
+        if error is not None:
+            return error
+        try:
+            session = stages.advance(session)
+        except stages.FinalStageReachedError:
+            return prompts.final_stage_reached(session)
+        store.save(session, session.save_path)
+        index.upsert(data_root, session)
+        return prompts.stage_advanced(session)
+
+
 def create_server(root: Path | str | None = None) -> FastMCP:
     """Build a fresh `deep-think-mcp` FastMCP server instance.
 
@@ -260,6 +300,7 @@ def create_server(root: Path | str | None = None) -> FastMCP:
     data_root = Path(root).expanduser().resolve() if root is not None else config.resolve_root()
     mcp = FastMCP(SERVER_NAME)
     _register_lifecycle_tools(mcp, data_root)
+    _register_stage_tools(mcp, data_root)
     return mcp
 
 

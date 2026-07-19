@@ -299,3 +299,31 @@ def session_kept(session: Session) -> dict[str, Any]:
         "save_path": session.save_path,
         "message": "Session will stay at its current location.",
     }
+
+
+# ---------------------------------------------------------------------------
+# advance_stage() -- Task 5, Layer 3 (stage machine).
+# ---------------------------------------------------------------------------
+
+
+def stage_advanced(session: Session) -> dict[str, Any]:
+    return {
+        "session_id": session.id,
+        "current_stage": session.current_stage,
+        "expected_stages": list(session.expected_stages),
+        "message": f"Advanced to stage '{session.current_stage}'.",
+    }
+
+
+def final_stage_reached(session: Session) -> dict[str, Any]:
+    return {
+        "session_id": session.id,
+        "current_stage": session.current_stage,
+        "final_stage": True,
+        "next_tool": "finalize_session",
+        "message": (
+            f"'{session.current_stage}' is the final stage -- there is no "
+            "next stage to advance to. Call finalize_session(session_id) "
+            "when this session's reasoning is complete."
+        ),
+    }

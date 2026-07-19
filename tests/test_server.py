@@ -392,11 +392,12 @@ async def test_mode_gate_returns_not_found_for_unknown_session(tmp_path):
 
 
 # ---------------------------------------------------------------------------
-# create_server() tool surface: exactly the 9 lifecycle tools, no more
+# create_server() tool surface: exactly the 9 lifecycle tools + Task 5's
+# advance_stage, no more
 # ---------------------------------------------------------------------------
 
 
-async def test_create_server_registers_exactly_the_lifecycle_tools(tmp_path):
+async def test_create_server_registers_exactly_the_lifecycle_and_stage_tools(tmp_path):
     srv = server.create_server(root=tmp_path)
     async with create_connected_server_and_client_session(srv) as client:
         tools = await client.list_tools()
@@ -412,6 +413,7 @@ async def test_create_server_registers_exactly_the_lifecycle_tools(tmp_path):
         "finalize_session",
         "move_session",
         "keep_here",
+        "advance_stage",
     }
 
 
@@ -794,3 +796,109 @@ async def test_move_session_twice_accumulates_move_history_and_index_tracks_fina
     assert resumed["save_path"] == str(second_dest)
     by_id = {s["id"]: s for s in listed["sessions"]}
     assert by_id[session_id]["path"] == str(second_dest)
+
+
+# ---------------------------------------------------------------------------
+# advance_stage (Task 5) -- Layer 3, the stage machine. Gated by mode_gate:
+# a session with no mode set has no engine to hand its committed thoughts
+# to, so stage progression has nothing meaningful to do yet either (see
+# task-5-report.md for the reasoning behind gating a non-thought-loop tool
+# this way).
+# ---------------------------------------------------------------------------
+
+
+async def test_advance_stage_moves_through_default_stages(tmp_path):
+    srv = server.create_server(root=tmp_path)
+    async with create_connected_server_and_client_session(srv) as client:
+        started = await _call(client, "start_session", {"question": "q", "mode": "serial"})
+        session_id = started["session_id"]
+
+        first = await _call(client, "advance_stage", {"session_id": session_id})
+        second = await _call(client, "advance_stage", {"session_id": session_id})
+
+    assert first["current_stage"] == "Research"
+    assert second["current_stage"] == "Analysis"
+
+    session = store.load(store.session_path(tmp_path, session_id))
+    assert session.current_stage == "Analysis"
+
+
+async def test_advance_stage_honors_custom_stages(tmp_path):
+    srv = server.create_server(root=tmp_path)
+    async with create_connected_server_and_client_session(srv) as client:
+        started = await _call(
+            client,
+            "start_session",
+            {"question": "q", "mode": "serial", "stages": ["Alpha", "Beta"]},
+        )
+        session_id = started["session_id"]
+
+        payload = await _call(client, "advance_stage", {"session_id": session_id})
+
+    assert payload["current_stage"] == "Beta"
+    session = store.load(store.session_path(tmp_path, session_id))
+    assert session.current_stage == "Beta"
+
+
+async def test_advance_stage_cursor_survives_resume(tmp_path):
+    """Cursor integrity across persistence, at the MCP-tool level: advance
+    via the real tool call, then a fresh resume_session call must see the
+    persisted (not just in-memory) result.
+    """
+    srv = server.create_server(root=tmp_path)
+    async with create_connected_server_and_client_session(srv) as client:
+        started = await _call(client, "start_session", {"question": "q", "mode": "serial"})
+        session_id = started["session_id"]
+
+        await _call(client, "advance_stage", {"session_id": session_id})
+        resumed = await _call(client, "resume_session", {"session_id": session_id})
+
+    assert resumed["current_stage"] == "Research"
+
+
+async def test_advance_stage_at_final_stage_returns_finalize_directive(tmp_path):
+    srv = server.create_server(root=tmp_path)
+    async with create_connected_server_and_client_session(srv) as client:
+        started = await _call(
+            client,
+            "start_session",
+            {"question": "q", "mode": "serial", "stages": ["OnlyStage"]},
+        )
+        session_id = started["session_id"]
+
+        payload = await _call(client, "advance_stage", {"session_id": session_id})
+
+    assert payload["next_tool"] == "finalize_session"
+    assert payload["current_stage"] == "OnlyStage"
+    assert "final" in payload["message"].lower()
+
+    # never mutated: the session was already at its (only) stage before
+    # this call, and must remain exactly so afterward
+    session = store.load(store.session_path(tmp_path, session_id))
+    assert session.current_stage == "OnlyStage"
+    assert session.status == "active"
+
+
+async def test_advance_stage_blocked_without_mode(tmp_path):
+    srv = server.create_server(root=tmp_path)
+    async with create_connected_server_and_client_session(srv) as client:
+        started = await _call(client, "start_session", {"question": "q"})
+        session_id = started["session_id"]
+
+        payload = await _call(client, "advance_stage", {"session_id": session_id})
+
+    assert payload["mode_required"] is True
+    assert payload["blocked_tool"] == "advance_stage"
+    assert payload["next_tool"] == "set_session_mode"
+
+    # confirm it truly never advanced
+    session = store.load(store.session_path(tmp_path, session_id))
+    assert session.current_stage == "Problem Definition"
+
+
+async def test_advance_stage_unknown_session_returns_not_found(tmp_path):
+    srv = server.create_server(root=tmp_path)
+    async with create_connected_server_and_client_session(srv) as client:
+        payload = await _call(client, "advance_stage", {"session_id": "nope"})
+
+    assert payload["error"] == "session_not_found"
