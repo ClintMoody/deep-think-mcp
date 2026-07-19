@@ -212,6 +212,69 @@ def test_index_raises_when_main_file_corrupt_and_no_bak(tmp_path):
         index.list_all(tmp_path)
 
 
+@pytest.mark.parametrize("empty_content", ["", "   ", "\n"])
+def test_index_recovers_from_bak_when_main_file_is_empty(tmp_path, empty_content):
+    """An existing-but-empty index.json is exactly what a crash mid-write
+    (truncate-then-write) leaves behind -- it must trigger .bak recovery
+    the same as corrupt JSON, not be silently treated as an empty index.
+    """
+    session = _make_session()
+    index.upsert(tmp_path, session)
+    good_content = (tmp_path / "index.json").read_text()
+
+    bak_path = tmp_path / "index.json.bak"
+    bak_path.write_text(good_content)
+    (tmp_path / "index.json").write_text(empty_content)
+
+    entries = index.list_all(tmp_path)
+
+    assert session.id in entries
+    assert not bak_path.exists()
+    # The main file must have been repaired, not left empty.
+    assert json.loads((tmp_path / "index.json").read_text())
+
+
+def test_index_raises_when_main_file_empty_and_no_bak(tmp_path):
+    (tmp_path / "index.json").write_text("")
+
+    with pytest.raises(json.JSONDecodeError):
+        index.list_all(tmp_path)
+
+
+def test_upsert_after_empty_main_file_recovery_preserves_recovered_entries(
+    tmp_path,
+):
+    """Regression: upsert() must not destroy the last-good .bak by copying
+    an empty main file over it before recovery has restored good content.
+    """
+    session_a = _make_session(question="a")
+    index.upsert(tmp_path, session_a)
+    good_content = (tmp_path / "index.json").read_text()
+
+    bak_path = tmp_path / "index.json.bak"
+    bak_path.write_text(good_content)
+    (tmp_path / "index.json").write_text("")
+
+    session_b = _make_session(question="b")
+    index.upsert(tmp_path, session_b)
+
+    entries = index.list_all(tmp_path)
+    assert session_a.id in entries
+    assert session_b.id in entries
+
+
+def test_index_recovers_from_bak_when_main_file_is_missing(tmp_path):
+    session = _make_session()
+    bak_path = tmp_path / "index.json.bak"
+    bak_path.write_text(json.dumps({session.id: {"path": session.save_path}}))
+
+    entries = index.list_all(tmp_path)
+
+    assert session.id in entries
+    assert (tmp_path / "index.json").exists()
+    assert not bak_path.exists()
+
+
 # ---------------------------------------------------------------------------
 # Locked read-modify-write holds under concurrent contention: N distinct
 # concurrent upserts must not lose entries to the classic read-modify-write

@@ -44,21 +44,26 @@ def _bak_path(path: Path) -> Path:
 def _read_locked(path: Path, bak: Path) -> dict[str, Any]:
     """Read the index dict, recovering from `.bak` if the main file is
     missing/empty/corrupt. Must be called while holding the lock.
+
+    An empty (or whitespace-only) main file is deliberately NOT
+    short-circuited to `{}` here -- that's exactly what a crash mid-write
+    (truncate-then-write) leaves behind, and it must be treated the same as
+    corrupt JSON: recover from `.bak` if one exists, otherwise raise.
+    `json.loads` rejects empty/whitespace-only text on its own, so no
+    special-casing is needed beyond letting that `ValueError` flow into the
+    same recovery path as any other parse failure.
     """
     if path.exists():
-        text = path.read_text().strip()
-        if not text:
-            return {}
         try:
-            return json.loads(text)
+            return json.loads(path.read_text())
         except ValueError:
             if not bak.exists():
                 raise
     elif not bak.exists():
         return {}
 
-    # Recover from .bak: either the main file was missing, or corrupt and a
-    # .bak exists. Restore it as the main file and return its contents.
+    # Recover from .bak: either the main file was missing, or empty/corrupt
+    # and a .bak exists. Restore it as the main file and return its contents.
     data = bak.read_text()
     parsed = json.loads(data)
     path.write_text(data)
