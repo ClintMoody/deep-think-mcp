@@ -206,3 +206,71 @@ def session_not_found(session_id: str) -> dict[str, Any]:
         "error": "session_not_found",
         "message": f"No session found with id '{session_id}'.",
     }
+
+
+# ---------------------------------------------------------------------------
+# finalize_session() -- Task 4. Wording is the exact canned text from
+# `docs/build-plan.md` § "Finalize + move flow", verbatim per the task
+# brief: the model reads `human_prompt` to the user unmodified.
+# ---------------------------------------------------------------------------
+
+
+def session_finalized(session: Session) -> dict[str, Any]:
+    return {
+        "session_id": session.id,
+        "status": session.status,
+        "current_path": session.save_path,
+        "human_prompt": (
+            f"Your reasoning is saved at `{session.save_path}`. Would you "
+            "like to move it elsewhere (a project folder, your Documents, "
+            "etc.), or leave it where it is?"
+        ),
+        "available_tools": [
+            {
+                "name": "move_session",
+                "description": "Move the session file to a new location.",
+            },
+            {
+                "name": "keep_here",
+                "description": "Leave the session file where it is.",
+            },
+        ],
+    }
+
+
+# ---------------------------------------------------------------------------
+# move_session()
+# ---------------------------------------------------------------------------
+
+
+def session_moved(session: Session) -> dict[str, Any]:
+    last_move = session.move_history[-1]
+    return {
+        "session_id": session.id,
+        "status": session.status,
+        "from_path": last_move.from_path,
+        "new_path": session.save_path,
+        "message": f"Session moved to `{session.save_path}`.",
+    }
+
+
+def move_failed(session_id: str, code: str, message: str) -> dict[str, Any]:
+    return {
+        "session_id": session_id,
+        "error": code,
+        "message": message,
+    }
+
+
+# ---------------------------------------------------------------------------
+# keep_here()
+# ---------------------------------------------------------------------------
+
+
+def session_kept(session: Session) -> dict[str, Any]:
+    return {
+        "session_id": session.id,
+        "status": session.status,
+        "save_path": session.save_path,
+        "message": "Session will stay at its current location.",
+    }

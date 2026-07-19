@@ -391,7 +391,7 @@ async def test_mode_gate_returns_not_found_for_unknown_session(tmp_path):
 
 
 # ---------------------------------------------------------------------------
-# create_server() tool surface: exactly the 6 lifecycle tools, no more
+# create_server() tool surface: exactly the 9 lifecycle tools, no more
 # ---------------------------------------------------------------------------
 
 
@@ -408,4 +408,253 @@ async def test_create_server_registers_exactly_the_lifecycle_tools(tmp_path):
         "resume_session",
         "list_sessions",
         "clear_session",
+        "finalize_session",
+        "move_session",
+        "keep_here",
     }
+
+
+# ---------------------------------------------------------------------------
+# finalize_session
+# ---------------------------------------------------------------------------
+
+
+async def test_finalize_session_returns_human_prompt_and_available_tools(tmp_path):
+    srv = server.create_server(root=tmp_path)
+    async with create_connected_server_and_client_session(srv) as client:
+        started = await _call(client, "start_session", {"question": "q", "mode": "serial"})
+        session_id = started["session_id"]
+
+        payload = await _call(client, "finalize_session", {"session_id": session_id})
+
+    assert payload["status"] == "finalized"
+    assert payload["current_path"] == str(store.session_path(tmp_path, session_id))
+    expected_prompt = (
+        f"Your reasoning is saved at `{payload['current_path']}`. Would you "
+        "like to move it elsewhere (a project folder, your Documents, "
+        "etc.), or leave it where it is?"
+    )
+    assert payload["human_prompt"] == expected_prompt
+    tool_names = {t["name"] for t in payload["available_tools"]}
+    assert tool_names == {"move_session", "keep_here"}
+
+    session = store.load(store.session_path(tmp_path, session_id))
+    assert session.status == "finalized"
+
+
+async def test_finalize_session_unknown_id_returns_not_found(tmp_path):
+    srv = server.create_server(root=tmp_path)
+    async with create_connected_server_and_client_session(srv) as client:
+        payload = await _call(client, "finalize_session", {"session_id": "nope"})
+
+    assert payload["error"] == "session_not_found"
+
+
+# ---------------------------------------------------------------------------
+# finalize -> move -> resume: the brief's headline round trip. A session
+# moved outside the data root must stay fully functional -- list_sessions
+# and resume_session find it via the index's absolute path.
+# ---------------------------------------------------------------------------
+
+
+async def test_finalize_then_move_then_resume_works(tmp_path):
+    dest_dir = tmp_path / "outside" / "Documents"
+    dest_dir.mkdir(parents=True)
+    dest = dest_dir / "my-reasoning.json"
+
+    srv = server.create_server(root=tmp_path)
+    async with create_connected_server_and_client_session(srv) as client:
+        started = await _call(
+            client, "start_session", {"question": "move me", "mode": "serial"}
+        )
+        session_id = started["session_id"]
+        original_path = store.session_path(tmp_path, session_id)
+
+        await _call(client, "finalize_session", {"session_id": session_id})
+        moved = await _call(
+            client, "move_session", {"session_id": session_id, "new_path": str(dest)}
+        )
+
+        resumed = await _call(client, "resume_session", {"session_id": session_id})
+        listed = await _call(client, "list_sessions")
+
+    assert moved["new_path"] == str(dest)
+    assert moved["from_path"] == str(original_path)
+    assert not original_path.exists()
+    assert dest.is_file()
+
+    assert resumed["session_id"] == session_id
+    assert resumed["save_path"] == str(dest)
+    assert resumed["status"] == "finalized"
+
+    by_id = {s["id"]: s for s in listed["sessions"]}
+    assert by_id[session_id]["path"] == str(dest)
+
+    # the moved file itself carries the move in its audit trail
+    on_disk = store.load(dest)
+    assert len(on_disk.move_history) == 1
+    assert on_disk.move_history[0].from_path == str(original_path)
+    assert on_disk.move_history[0].to_path == str(dest)
+
+
+# ---------------------------------------------------------------------------
+# finalize -> keep_here: file stays put and stays indexed
+# ---------------------------------------------------------------------------
+
+
+async def test_finalize_then_keep_here_leaves_file_in_place_and_indexed(tmp_path):
+    srv = server.create_server(root=tmp_path)
+    async with create_connected_server_and_client_session(srv) as client:
+        started = await _call(
+            client, "start_session", {"question": "stay put", "mode": "serial"}
+        )
+        session_id = started["session_id"]
+        original_path = store.session_path(tmp_path, session_id)
+
+        await _call(client, "finalize_session", {"session_id": session_id})
+        payload = await _call(client, "keep_here", {"session_id": session_id})
+
+        resumed = await _call(client, "resume_session", {"session_id": session_id})
+
+    assert payload["save_path"] == str(original_path)
+    assert original_path.is_file()
+
+    session = store.load(original_path)
+    assert session.save_path == str(original_path)
+    assert len(session.decisions) == 1
+    assert session.decisions[0].action == "keep_here"
+
+    assert resumed["save_path"] == str(original_path)
+    assert index.get(tmp_path, session_id)["path"] == str(original_path)
+
+
+async def test_keep_here_unknown_id_returns_not_found(tmp_path):
+    srv = server.create_server(root=tmp_path)
+    async with create_connected_server_and_client_session(srv) as client:
+        payload = await _call(client, "keep_here", {"session_id": "nope"})
+
+    assert payload["error"] == "session_not_found"
+
+
+# ---------------------------------------------------------------------------
+# move_session: clobber protection, force override, unwritable destination
+# ---------------------------------------------------------------------------
+
+
+async def test_move_session_fails_cleanly_when_destination_exists_without_force(
+    tmp_path,
+):
+    dest = tmp_path / "elsewhere" / "taken.json"
+    dest.parent.mkdir(parents=True)
+    dest.write_text("something already lives here")
+
+    srv = server.create_server(root=tmp_path)
+    async with create_connected_server_and_client_session(srv) as client:
+        started = await _call(client, "start_session", {"question": "q", "mode": "serial"})
+        session_id = started["session_id"]
+        original_path = store.session_path(tmp_path, session_id)
+
+        payload = await _call(
+            client, "move_session", {"session_id": session_id, "new_path": str(dest)}
+        )
+
+        resumed = await _call(client, "resume_session", {"session_id": session_id})
+
+    assert payload["error"] == "destination_exists"
+    assert dest.read_text() == "something already lives here"
+    assert original_path.is_file()
+    assert resumed["save_path"] == str(original_path)
+
+
+async def test_move_session_with_force_overwrites_existing_destination(tmp_path):
+    dest = tmp_path / "elsewhere" / "taken.json"
+    dest.parent.mkdir(parents=True)
+    dest.write_text("stale")
+
+    srv = server.create_server(root=tmp_path)
+    async with create_connected_server_and_client_session(srv) as client:
+        started = await _call(client, "start_session", {"question": "q", "mode": "serial"})
+        session_id = started["session_id"]
+        original_path = store.session_path(tmp_path, session_id)
+
+        payload = await _call(
+            client,
+            "move_session",
+            {"session_id": session_id, "new_path": str(dest), "force": True},
+        )
+
+    assert "error" not in payload
+    assert payload["new_path"] == str(dest)
+    assert not original_path.exists()
+    assert store.load(dest).id == session_id
+
+
+async def test_move_session_fails_cleanly_when_destination_not_writable(tmp_path):
+    locked_dir = tmp_path / "locked"
+    locked_dir.mkdir()
+    locked_dir.chmod(0o555)
+    dest = locked_dir / "moved.json"
+
+    srv = server.create_server(root=tmp_path)
+    try:
+        async with create_connected_server_and_client_session(srv) as client:
+            started = await _call(
+                client, "start_session", {"question": "q", "mode": "serial"}
+            )
+            session_id = started["session_id"]
+            original_path = store.session_path(tmp_path, session_id)
+
+            payload = await _call(
+                client, "move_session", {"session_id": session_id, "new_path": str(dest)}
+            )
+
+        assert payload["error"] == "destination_not_writable"
+        assert original_path.is_file()
+    finally:
+        locked_dir.chmod(0o755)  # let pytest clean up tmp_path
+
+
+async def test_move_session_unknown_id_returns_not_found(tmp_path):
+    srv = server.create_server(root=tmp_path)
+    async with create_connected_server_and_client_session(srv) as client:
+        payload = await _call(
+            client,
+            "move_session",
+            {"session_id": "nope", "new_path": str(tmp_path / "x.json")},
+        )
+
+    assert payload["error"] == "session_not_found"
+
+
+# ---------------------------------------------------------------------------
+# move_session: cross-filesystem-safe -- must go through the copy+verify+
+# unlink path, never a bare rename (which raises EXDEV crossing devices).
+# ---------------------------------------------------------------------------
+
+
+async def test_move_session_survives_rename_being_unavailable(tmp_path, monkeypatch):
+    import os
+    import shutil
+
+    def _boom(*args, **kwargs):
+        raise AssertionError("move_session must not call rename/shutil.move")
+
+    monkeypatch.setattr(os, "rename", _boom)
+    monkeypatch.setattr(shutil, "move", _boom)
+
+    dest = tmp_path / "elsewhere" / "moved.json"
+    dest.parent.mkdir(parents=True)
+
+    srv = server.create_server(root=tmp_path)
+    async with create_connected_server_and_client_session(srv) as client:
+        started = await _call(client, "start_session", {"question": "q", "mode": "serial"})
+        session_id = started["session_id"]
+
+        payload = await _call(
+            client, "move_session", {"session_id": session_id, "new_path": str(dest)}
+        )
+
+    assert "error" not in payload
+    assert payload["new_path"] == str(dest)
+    assert dest.is_file()
+    assert store.load(dest).id == session_id

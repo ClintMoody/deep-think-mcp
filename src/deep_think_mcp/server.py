@@ -1,9 +1,15 @@
 """deep-think-mcp: MCP server -- tool registration + dispatch.
 
 `create_server(root)` builds a FastMCP server instance and registers the
-session-lifecycle tools (Layer 6 -- the lifecycle-manager half this task
-owns; finalize/move/keep arrive in Task 4) per
-`docs/build-plan.md` § "Tool API surface" > "Session lifecycle".
+session-lifecycle tools (Layer 6, the lifecycle manager) per
+`docs/build-plan.md` § "Tool API surface" > "Session lifecycle": the six
+Task 3 tools (`start_session`, `set_session_mode`, `list_modes`,
+`resume_session`, `list_sessions`, `clear_session`) plus Task 4's finalize
+/ move / keep-here trio (`finalize_session`, `move_session`, `keep_here`).
+The finalize/move/keep *logic* lives in `lifecycle.py`; this module only
+loads/persists sessions around calls into it and maps results to
+`prompts.py` templates -- same division of labor `store.py`/`index.py`
+already establish.
 
 The other half of this module is `mode_gate`: Layer 2 (mode dispatcher) per
 `docs/build-plan.md` § "Architecture at a glance" -- "Reads session.mode and
@@ -24,7 +30,7 @@ from typing import Any, Callable, Literal
 
 from mcp.server.fastmcp import FastMCP
 
-from deep_think_mcp import config, index, prompts, store
+from deep_think_mcp import config, index, lifecycle, prompts, store
 from deep_think_mcp.session import Session
 
 SERVER_NAME = "deep-think-mcp"
@@ -91,12 +97,13 @@ def mode_gate(
 
 
 def _register_lifecycle_tools(mcp: FastMCP, data_root: Path) -> None:
-    """Register the six session-lifecycle tools per
-    `docs/execution-plan.md` Task 3. None of these are gated by
-    `mode_gate` -- they're exactly the tools that must keep working
-    *before* a mode is chosen (`start_session`, `set_session_mode`,
-    `list_modes`) or regardless of it (`resume_session`, `list_sessions`,
-    `clear_session`).
+    """Register the nine session-lifecycle tools: the six from
+    `docs/execution-plan.md` Task 3, plus Task 4's finalize/move/keep-here
+    trio. None of these are gated by `mode_gate` -- they're exactly the
+    tools that must keep working *before* a mode is chosen
+    (`start_session`, `set_session_mode`, `list_modes`) or regardless of it
+    (`resume_session`, `list_sessions`, `clear_session`,
+    `finalize_session`, `move_session`, `keep_here`).
     """
 
     @mcp.tool()
@@ -179,6 +186,54 @@ def _register_lifecycle_tools(mcp: FastMCP, data_root: Path) -> None:
         Path(entry["path"]).unlink(missing_ok=True)
         index.remove(data_root, session_id)
         return prompts.session_cleared(session_id)
+
+    @mcp.tool()
+    def finalize_session(session_id: str) -> dict[str, Any]:
+        """Mark a session finalized. Returns the finalize+move payload:
+        where the session is saved, the canned human_prompt asking whether
+        to move it, and the two tools (`move_session`, `keep_here`) that
+        answer that question.
+        """
+        session, error = _load_session(data_root, session_id)
+        if error is not None:
+            return error
+        session = lifecycle.finalize(session)
+        store.save(session, session.save_path)
+        index.upsert(data_root, session)
+        return prompts.session_finalized(session)
+
+    @mcp.tool()
+    def move_session(session_id: str, new_path: str, force: bool = False) -> dict[str, Any]:
+        """Move a session's file to `new_path`.
+
+        `new_path` must be an absolute path (`~` is expanded). If it names
+        an existing directory, the session moves into that directory under
+        its current filename. Fails cleanly -- without touching the
+        session or the filesystem -- if the destination already exists
+        (unless `force=true`), isn't writable, or doesn't exist.
+        """
+        session, error = _load_session(data_root, session_id)
+        if error is not None:
+            return error
+        try:
+            session = lifecycle.move(session, new_path, force=force)
+        except lifecycle.MoveError as exc:
+            return prompts.move_failed(session_id, exc.code, exc.message)
+        index.upsert(data_root, session)
+        return prompts.session_moved(session)
+
+    @mcp.tool()
+    def keep_here(session_id: str) -> dict[str, Any]:
+        """Record that the user declined to move the session. No
+        filesystem change.
+        """
+        session, error = _load_session(data_root, session_id)
+        if error is not None:
+            return error
+        session = lifecycle.keep_here(session)
+        store.save(session, session.save_path)
+        index.upsert(data_root, session)
+        return prompts.session_kept(session)
 
 
 def create_server(root: Path | str | None = None) -> FastMCP:
