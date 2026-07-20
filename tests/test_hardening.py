@@ -261,6 +261,53 @@ async def test_lock_timeout_on_read_returns_storage_directive(tmp_path, monkeypa
 
 
 # ---------------------------------------------------------------------------
+# F1 corrupt JSON (ValueError family) at the load boundary -> storage directive
+# ---------------------------------------------------------------------------
+
+
+async def test_corrupt_session_file_no_bak_returns_storage_directive(tmp_path):
+    """F1: a corrupt session JSON with no `.bak` raises pydantic
+    ValidationError (a ValueError subclass) at store.load; storage_guard must
+    degrade it to a storage_unavailable directive, not a raw isError."""
+    srv = server.create_server(root=tmp_path)
+    async with create_connected_server_and_client_session(srv) as client:
+        started = await _call(client, "start_session", {"question": "q", "mode": "serial"})
+        sid = started["session_id"]
+
+        path = store.session_path(tmp_path, sid)
+        bak = path.with_name(path.name + ".bak")
+        if bak.exists():
+            bak.unlink()  # no .bak sibling can recover the corruption
+        path.write_text("{ this is not valid session json")
+
+        payload = await _call(client, "resume_session", {"session_id": sid})
+
+    assert payload["error"] == "storage_unavailable"
+    assert payload["retryable"] is True
+    assert payload["session_id"] == sid
+
+
+async def test_corrupt_index_file_no_bak_returns_storage_directive(tmp_path):
+    """F1: a corrupt index.json with no `.bak` raises json.JSONDecodeError (a
+    ValueError subclass) at index._read_locked; storage_guard must degrade it
+    to a storage_unavailable directive, not a raw isError."""
+    srv = server.create_server(root=tmp_path)
+    async with create_connected_server_and_client_session(srv) as client:
+        await _call(client, "start_session", {"question": "q", "mode": "serial"})
+
+        idx = server.index.index_path(tmp_path)
+        bak = idx.with_name(idx.name + ".bak")
+        if bak.exists():
+            bak.unlink()
+        idx.write_text("{ not valid json either")
+
+        payload = await _call(client, "list_sessions")
+
+    assert payload["error"] == "storage_unavailable"
+    assert payload["retryable"] is True
+
+
+# ---------------------------------------------------------------------------
 # #7 lens_loader UTF-8 encoding pin
 # ---------------------------------------------------------------------------
 

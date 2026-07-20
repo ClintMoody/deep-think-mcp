@@ -12,9 +12,10 @@ from __future__ import annotations
 
 import pytest
 
-from deep_think_mcp import subagent_engine
+from deep_think_mcp import prompts, subagent_engine
 from deep_think_mcp.necort_adapter import NECoRTResult
 from deep_think_mcp.session import Session, SpecialistRound, UtilityScore
+from deep_think_mcp.subagent_engine import MatrixState
 
 
 # ---------------------------------------------------------------------------
@@ -322,3 +323,48 @@ async def test_stage_weighting_injected_into_prompt(monkeypatch):
     # The Analysis specialist is emphasized in the Analysis stage (weight 1.5).
     assert "Analysis" in prompt
     assert "1.5" in prompt
+
+
+# ---------------------------------------------------------------------------
+# F2 inspect_utility_matrix directive honesty at budget exhaustion
+# ---------------------------------------------------------------------------
+
+
+def _matrix_state(*, rounds_run, max_rounds, strength, threshold, converged):
+    return MatrixState(
+        thought_id="t1",
+        us_round=rounds_run,
+        rounds_run=rounds_run,
+        max_rounds=max_rounds,
+        selected_content="best so far",
+        strength=strength,
+        threshold=threshold,
+        converged=converged,
+    )
+
+
+def test_subagent_matrix_commits_at_budget_exhaustion_below_threshold():
+    """F2: inspect_utility_matrix must NOT name advance_subagent_round once the
+    round budget is spent -- that tool refuses with round_budget_exhausted,
+    contradicting next_action and the round verdict which both say commit."""
+    state = _matrix_state(
+        rounds_run=2, max_rounds=2, strength=0.60, threshold=0.75, converged=False
+    )
+    payload = prompts.subagent_matrix(_session(), state)
+    assert payload["next_tool"] == "commit_subagent_thought"
+
+
+def test_subagent_matrix_advances_when_budget_remains_below_threshold():
+    state = _matrix_state(
+        rounds_run=1, max_rounds=2, strength=0.60, threshold=0.75, converged=False
+    )
+    payload = prompts.subagent_matrix(_session(), state)
+    assert payload["next_tool"] == "advance_subagent_round"
+
+
+def test_subagent_matrix_commits_when_converged():
+    state = _matrix_state(
+        rounds_run=1, max_rounds=2, strength=0.90, threshold=0.75, converged=True
+    )
+    payload = prompts.subagent_matrix(_session(), state)
+    assert payload["next_tool"] == "commit_subagent_thought"

@@ -193,6 +193,14 @@ def storage_guard(
     `LockException` (or bare `OSError`) that reaches the boundary degrades to
     a clean, retryable `storage_unavailable` directive instead.
 
+    [F1] Also catches the `ValueError` family so a *corrupt* session/index
+    file at the load boundary degrades the same way: `store.load` raises
+    pydantic `ValidationError` (a `ValueError` subclass) on invalid session
+    JSON, and `index._read_locked` raises `json.JSONDecodeError` (likewise a
+    `ValueError`) on a corrupt `index.json` with no recoverable `.bak` --
+    both are storage faults, not programming bugs. Genuine `TypeError`s (real
+    programming errors) are deliberately left to surface.
+
     Stacked OUTSIDE `mode_gate` (so it also catches faults in the gate's own
     session load) and BELOW `@mcp.tool()` (so FastMCP still introspects the
     real signature via the `functools.wraps` `__wrapped__` chain, same
@@ -214,7 +222,7 @@ def storage_guard(
         async def async_wrapper(*args: Any, **kwargs: Any) -> dict[str, Any]:
             try:
                 return await fn(*args, **kwargs)
-            except (LockException, OSError) as exc:
+            except (LockException, OSError, ValueError) as exc:
                 return prompts.storage_unavailable(
                     _session_id(args, kwargs), f"{type(exc).__name__}: {exc}"
                 )
@@ -225,7 +233,7 @@ def storage_guard(
     def wrapper(*args: Any, **kwargs: Any) -> dict[str, Any]:
         try:
             return fn(*args, **kwargs)
-        except (LockException, OSError) as exc:
+        except (LockException, OSError, ValueError) as exc:
             return prompts.storage_unavailable(
                 _session_id(args, kwargs), f"{type(exc).__name__}: {exc}"
             )

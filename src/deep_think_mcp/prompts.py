@@ -1154,7 +1154,15 @@ def subagent_matrix(session: Session, state: MatrixState) -> dict[str, Any]:
         "converged": state.converged,
         "selected_content": state.selected_content,
         "candidates": state.candidates,
-        "next_tool": "commit_subagent_thought" if state.converged else "advance_subagent_round",
+        # [F2] Commit not only when converged but also once the round budget is
+        # spent -- advance_subagent_round would refuse (round_budget_exhausted)
+        # there, contradicting next_action and the round verdict which both say
+        # commit for this same state.
+        "next_tool": (
+            "commit_subagent_thought"
+            if state.converged or state.rounds_run >= state.max_rounds
+            else "advance_subagent_round"
+        ),
         "message": (
             f"Current equilibrium: {state.rounds_run}/{state.max_rounds} round(s) "
             f"run, winning candidate's {state.metric_label} {state.strength:.2f} "
