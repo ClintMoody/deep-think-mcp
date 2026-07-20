@@ -2,6 +2,8 @@
 name = "deep-think-mcp"
 version = "0.1.0"
 description = "MCP server combining staged sequential reasoning with recursive self-critique, for local models."
+readme = "README.md"
+license = "MIT"
 authors = [
     { name = "Clint Moody", email = "100443920+ClintMoody@users.noreply.github.com" }
 ]
