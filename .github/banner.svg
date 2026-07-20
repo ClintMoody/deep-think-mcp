@@ -1,0 +1,55 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="900" height="240" viewBox="0 0 900 240" role="img" aria-label="deep-think-mcp — a structured, persistent scratchpad for hard thinking">
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#0f172a"/>
+      <stop offset="1" stop-color="#1e293b"/>
+    </linearGradient>
+    <linearGradient id="accent" x1="0" y1="0" x2="1" y2="0">
+      <stop offset="0" stop-color="#22C55E"/>
+      <stop offset="1" stop-color="#4ade80"/>
+    </linearGradient>
+    <style>
+      .title { font: 700 58px 'Segoe UI', Helvetica, Arial, sans-serif; fill: #f8fafc; letter-spacing: -1px; }
+      .mono  { font: 700 58px 'JetBrains Mono', 'Courier New', monospace; }
+      .tag   { font: 400 21px 'Segoe UI', Helvetica, Arial, sans-serif; fill: #94a3b8; }
+      .chip  { font: 600 15px 'Segoe UI', Helvetica, Arial, sans-serif; fill: #cbd5e1; }
+      .chipbox { fill: #334155; }
+    </style>
+  </defs>
+
+  <rect width="900" height="240" rx="16" fill="url(#bg)"/>
+  <rect x="0" y="0" width="6" height="240" rx="3" fill="url(#accent)"/>
+
+  <!-- staged reasoning motif: five ascending nodes -->
+  <g transform="translate(792,52)" opacity="0.9">
+    <circle cx="0"  cy="64" r="7" fill="#334155"/>
+    <circle cx="18" cy="50" r="7" fill="#475569"/>
+    <circle cx="36" cy="36" r="7" fill="#22C55E" opacity="0.55"/>
+    <circle cx="54" cy="22" r="7" fill="#22C55E" opacity="0.8"/>
+    <circle cx="72" cy="8"  r="7" fill="#22C55E"/>
+    <path d="M0 64 L18 50 L36 36 L54 22 L72 8" fill="none" stroke="#22C55E" stroke-width="2" opacity="0.5"/>
+  </g>
+
+  <text x="52" y="104" class="title">deep-<tspan fill="#22C55E">think</tspan>-<tspan class="mono" fill="#f8fafc">mcp</tspan></text>
+  <text x="54" y="146" class="tag">A structured, persistent scratchpad for hard thinking — built for local models.</text>
+
+  <!-- feature chips -->
+  <g transform="translate(54,178)">
+    <g>
+      <rect class="chipbox" x="0" y="0" width="164" height="34" rx="17"/>
+      <text x="82" y="22" text-anchor="middle" class="chip">staged reasoning</text>
+    </g>
+    <g transform="translate(176,0)">
+      <rect class="chipbox" x="0" y="0" width="156" height="34" rx="17"/>
+      <text x="78" y="22" text-anchor="middle" class="chip">self-critique</text>
+    </g>
+    <g transform="translate(344,0)">
+      <rect class="chipbox" x="0" y="0" width="196" height="34" rx="17"/>
+      <text x="98" y="22" text-anchor="middle" class="chip">multi-perspective</text>
+    </g>
+    <g transform="translate(552,0)">
+      <rect class="chipbox" x="0" y="0" width="150" height="34" rx="17"/>
+      <text x="75" y="22" text-anchor="middle" class="chip">persistent</text>
+    </g>
+  </g>
+</svg>
