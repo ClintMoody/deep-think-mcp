@@ -247,6 +247,7 @@ Copy-pasteable config for **Claude Desktop, Claude Code, Cursor, Continue, and L
 |---|---|
 | [`docs/GUIDE.md`](docs/GUIDE.md) | **The complete teaching guide** — concepts, architecture, both modes in depth, full tool/config/directive/data-model references, extension, FAQ, glossary. |
 | [`docs/wiring.md`](docs/wiring.md) | Exact client config for Claude Desktop, Claude Code, Cursor, Continue, LibreChat. |
+| [`docs/evaluation.md`](docs/evaluation.md) | **Agent-runnable A/B/C test** — does driving a model through the tool beat answering directly? Self-contained prompt, rubric, judge instructions, and report template. |
 | [`docs/build-plan.md`](docs/build-plan.md) | The original design document (the "why" behind the architecture). |
 | [`docs/execution-plan.md`](docs/execution-plan.md) | The task-by-task build breakdown with global constraints. |
 | [`docs/necort_deps.md`](docs/necort_deps.md) | Why `requests`/`numpy`/`openai` are dependencies of a project that never calls the OpenAI SDK. |
