@@ -21,6 +21,7 @@ from typing import TYPE_CHECKING, Any
 from deep_think_mcp.session import Session, Thought
 
 if TYPE_CHECKING:
+    from deep_think_mcp.meta import CompressResult, NextAction, SummaryResult
     from deep_think_mcp.serial_engine import CritiquePrompt, ScoreResult
 
 # ---------------------------------------------------------------------------
@@ -562,3 +563,199 @@ def serial_directive(session_id: str, code: str, **detail: Any) -> dict[str, Any
     if code == "unknown_lens" and "lenses" in detail:
         payload["available_lenses"] = detail["lenses"]
     return payload
+
+
+# ---------------------------------------------------------------------------
+# Task 8: meta tools (next_action, summarize_session, compress_history) +
+# import/export. All wording for `meta.py`'s pure results lives here, same
+# division of labor Task 7 established.
+# ---------------------------------------------------------------------------
+
+# Static message per `meta.NextAction.code`. Codes whose wording needs a
+# session-specific value (the current stage name, the converged reason) are
+# NOT here -- `next_action_result` builds those inline -- everything else
+# is fixed text, same shape as `_SERIAL_DIRECTIVES`.
+_NEXT_ACTION_MESSAGES: dict[str, str] = {
+    "mode_required": (
+        "No mode is set yet. Read the mode descriptions to the user, then "
+        "call set_session_mode(session_id, mode)."
+    ),
+    "subagent_not_available": (
+        "This session is in subagent mode. Its engine tools aren't "
+        "implemented yet (arriving in later tasks) -- there is no "
+        "thought-loop action available on this session right now."
+    ),
+    "loop_zero_rounds": (
+        "A thought is drafted but hasn't been critiqued yet. Call "
+        "critique_current_thought(session_id)."
+    ),
+    "loop_await_critique": (
+        "A critique lens is open but its critique hasn't been submitted "
+        "yet. Call submit_critique(session_id, text)."
+    ),
+    "loop_await_refine": (
+        "The critique is in; the thought hasn't been refined yet. Call "
+        "refine_current_thought(session_id, new_content)."
+    ),
+    "loop_await_score": (
+        "The thought was refined; it hasn't been scored yet. Call "
+        "score_current_thought(session_id, scores)."
+    ),
+    "loop_continue": (
+        "Not yet converged -- the thought is still improving. Call "
+        "critique_current_thought(session_id) for another round."
+    ),
+    "await_move_decision": (
+        "This session is finalized but its final location hasn't been "
+        "decided yet. Call move_session(session_id, new_path) to relocate "
+        "it, or keep_here(session_id) to leave it where it is."
+    ),
+    "session_complete": (
+        "This session is finalized and its location is settled. There is "
+        "nothing further to do."
+    ),
+    "session_archived": "This session is archived. There is nothing further to do.",
+}
+
+
+def next_action_result(session: Session, result: NextAction) -> dict[str, Any]:
+    """The authoritative next-step payload for `meta.next_action`. Message
+    wording is static per `_NEXT_ACTION_MESSAGES` except for the three
+    codes below, whose text needs a value only known at call time (the
+    current stage name, or the specific convergence reason).
+    """
+    if result.code == "loop_no_thought_final_stage":
+        message = (
+            f"'{session.current_stage}' is the final stage and no thought "
+            "is in progress. Call finalize_session(session_id) when this "
+            "session's reasoning is complete (or begin_thought(session_id, "
+            "content) for one more thought in this stage first)."
+        )
+    elif result.code == "loop_no_thought_begin":
+        message = (
+            "No thought is in progress. Start one with "
+            "begin_thought(session_id, content), or "
+            f"advance_stage(session_id) if '{session.current_stage}' is done."
+        )
+    elif result.code == "loop_converged":
+        message = (
+            f"Converged ({result.detail.get('converged_reason')}). Call "
+            "commit_thought(session_id) to lock it in."
+        )
+    else:
+        message = _NEXT_ACTION_MESSAGES.get(
+            result.code, "Call the indicated tool to continue."
+        )
+
+    payload: dict[str, Any] = {
+        "session_id": session.id,
+        "code": result.code,
+        "next_tool": result.next_tool,
+        "message": message,
+    }
+    payload.update(result.detail)
+    return payload
+
+
+# ---------------------------------------------------------------------------
+# summarize_session(scope="stage"|"all")
+# ---------------------------------------------------------------------------
+
+
+def summary_result(session: Session, result: SummaryResult) -> dict[str, Any]:
+    if result.thought_count == 0:
+        message = f"No committed thoughts yet for scope '{result.scope}'."
+    else:
+        message = (
+            f"Digest of {result.thought_count} committed thought(s) across "
+            f"{len(result.stages_covered)} stage(s)."
+        )
+    return {
+        "session_id": session.id,
+        "scope": result.scope,
+        "stages_covered": result.stages_covered,
+        "thought_count": result.thought_count,
+        "digest": result.digest,
+        "entries": [
+            {
+                "thought_id": e.thought_id,
+                "stage": e.stage,
+                "position": e.position,
+                "line": e.line,
+                "overall_score": e.overall_score,
+                "tags": e.tags,
+            }
+            for e in result.entries
+        ],
+        "message": message,
+    }
+
+
+# ---------------------------------------------------------------------------
+# compress_history(target_tokens)
+# ---------------------------------------------------------------------------
+
+
+def compression_result(session: Session, result: CompressResult) -> dict[str, Any]:
+    if not result.included_thought_ids:
+        message = "No prior-stage history yet to compress."
+    else:
+        message = (
+            f"Digest covers {len(result.included_thought_ids)} prior-stage "
+            f"thought(s) (~{result.estimated_tokens} tokens, target "
+            f"{result.target_tokens})."
+        )
+        if result.omitted_count:
+            message += (
+                f" {result.omitted_count} older thought(s) omitted to stay "
+                "in budget."
+            )
+    return {
+        "session_id": session.id,
+        "digest": result.digest,
+        "stages_covered": result.stages_covered,
+        "included_thought_ids": result.included_thought_ids,
+        "estimated_tokens": result.estimated_tokens,
+        "target_tokens": result.target_tokens,
+        "omitted_count": result.omitted_count,
+        "message": message,
+    }
+
+
+# ---------------------------------------------------------------------------
+# export_session() / import_session()
+# ---------------------------------------------------------------------------
+
+
+def session_exported(session: Session, data: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "session_id": session.id,
+        "export": data,
+        "message": (
+            "Full session export below. Pass this whole payload's `export` "
+            "value to import_session(data) to recreate this session (on "
+            "this or another deep-think-mcp install)."
+        ),
+    }
+
+
+def import_failed(code: str, message: str) -> dict[str, Any]:
+    return {
+        "error": code,
+        "message": f"Could not import session: {message}",
+    }
+
+
+def session_imported(session: Session, id_reassigned: bool) -> dict[str, Any]:
+    message = f"Session imported as '{session.id}', saved at `{session.save_path}`."
+    if id_reassigned:
+        message += (
+            " Its original id collided with an existing session here, so a "
+            "new id was assigned."
+        )
+    return {
+        "session_id": session.id,
+        "save_path": session.save_path,
+        "id_reassigned": id_reassigned,
+        "message": message,
+    }

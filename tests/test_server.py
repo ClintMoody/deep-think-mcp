@@ -420,6 +420,11 @@ async def test_create_server_registers_exactly_the_lifecycle_and_stage_tools(tmp
         "refine_current_thought",
         "score_current_thought",
         "commit_thought",
+        "next_action",
+        "summarize_session",
+        "compress_history",
+        "export_session",
+        "import_session",
     }
 
 

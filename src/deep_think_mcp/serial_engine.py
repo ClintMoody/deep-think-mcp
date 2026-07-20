@@ -163,6 +163,38 @@ def _completed_rounds(thought: Thought) -> list[CritiqueRound]:
     return [r for r in thought.critique_rounds if _round_phase(r) == "complete"]
 
 
+# Session-level loop phase (Task 8's next_action() needs this): whether a
+# thought is in progress at all, and if so, which of the four in-flight
+# round steps it's waiting on, or whether its tail round is fully scored
+# and ready for a convergence check. Composed entirely from the helpers
+# above -- current_thought / _inflight_round / _round_phase -- so callers
+# (meta.next_action) never re-derive what a round's state means; this is
+# the one seam Task 8 is meant to call through instead.
+LOOP_PHASES: tuple[str, ...] = (
+    "no_thought",
+    "zero_rounds",
+    "await_critique",
+    "await_refine",
+    "await_score",
+    "round_complete",
+)
+
+
+def loop_phase(session: Session) -> str:
+    """One of `LOOP_PHASES` for `session`'s current in-progress thought (or
+    "no_thought" if none is in progress).
+    """
+    thought = current_thought(session)
+    if thought is None:
+        return "no_thought"
+    inflight = _inflight_round(thought)
+    if inflight is not None:
+        return _round_phase(inflight)  # "await_critique" | "await_refine" | "await_score"
+    if not thought.critique_rounds:
+        return "zero_rounds"
+    return "round_complete"
+
+
 def latest_content(thought: Thought) -> str:
     """The most recent refined content, or the raw draft if none yet."""
     for rnd in reversed(thought.critique_rounds):
@@ -182,7 +214,13 @@ def _prior_content_for(thought: Thought, target: CritiqueRound) -> str:
     return thought.content
 
 
-def _overall(score: UtilityScore) -> float:
+def overall_score(score: UtilityScore) -> float:
+    """The mean of the 7 utility dimensions -- one scalar summary of a
+    `UtilityScore`. Public (not `_`-prefixed): Task 8's meta tools
+    (`summarize_session`/`compress_history`) reuse this exact definition
+    for the score they display alongside each thought's extractive
+    snippet, rather than re-deriving "overall" a second way.
+    """
     return sum(getattr(score, dim) for dim in DIMENSIONS) / len(DIMENSIONS)
 
 
@@ -437,8 +475,8 @@ def score_current_thought(
 
     previous = thought.final_utility_scores  # last completed round's score, or None
     score = _merge_scores(raw_scores, previous)
-    overall = _overall(score)
-    prev_overall = _overall(previous) if previous is not None else 0.0
+    overall = overall_score(score)
+    prev_overall = overall_score(previous) if previous is not None else 0.0
     delta = overall - prev_overall
 
     inflight.delta_score = delta

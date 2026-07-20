@@ -30,6 +30,7 @@ tool, not a thought-loop tool, is gated the same way.
 from __future__ import annotations
 
 import functools
+import uuid
 from pathlib import Path
 from typing import Any, Callable, Literal
 
@@ -40,6 +41,7 @@ from deep_think_mcp import (
     index,
     lens_loader,
     lifecycle,
+    meta,
     prompts,
     serial_engine,
     stages,
@@ -455,6 +457,107 @@ def _register_serial_tools(mcp: FastMCP, data_root: Path) -> None:
         return prompts.thought_committed(session, thought)
 
 
+def _register_meta_tools(mcp: FastMCP, data_root: Path) -> None:
+    """Register Task 8's meta tools (Layer 5): `next_action` (the
+    authoritative next-step resolver across every session state x mode),
+    the two small-context accommodations `summarize_session` /
+    `compress_history` (deterministic extractive text ops -- no LLM calls,
+    per Global Constraints), and the `export_session` / `import_session`
+    portability pair. The logic for all five lives in `meta.py`; this
+    function only loads/persists sessions around calls into it and maps
+    results to `prompts.py` templates -- same load/mutate/persist division
+    `_register_serial_tools` follows.
+
+    None of these are wrapped in `mode_gate`: `next_action` does its own
+    mode dispatch (its very first job is telling a mode-less session to
+    call `set_session_mode`, and a subagent-mode session to wait on Tasks
+    9-11), and the rest operate on committed thoughts / session JSON
+    regardless of mode -- gating them would just be a second place that
+    same dispatch logic could drift out of sync.
+    """
+
+    def _persist(session: Session) -> None:
+        store.save(session, session.save_path)
+        index.upsert(data_root, session)
+
+    @mcp.tool()
+    def next_action(session_id: str) -> dict[str, Any]:
+        """Authoritative resolver: given this session's persisted state and
+        mode, return the exact next tool to call and a one-line directive.
+        Safe to call at any point in a session's lifecycle -- before a mode
+        is set, mid-critique-loop, right after a thought commits, at the
+        final stage, or once finalized.
+        """
+        session, error = _load_session(data_root, session_id)
+        if error is not None:
+            return error
+        cfg = config.load_config(root=data_root, overrides=session.overrides)
+        result = meta.next_action(session, cfg)
+        return prompts.next_action_result(session, result)
+
+    @mcp.tool()
+    def summarize_session(
+        session_id: str, scope: Literal["stage", "all"] = "stage"
+    ) -> dict[str, Any]:
+        """Deterministic extractive digest of this session's committed
+        thoughts. `scope="stage"` (default) covers only the current stage;
+        `scope="all"` covers every stage. No LLM calls -- this is text
+        extraction, not summarization by inference.
+        """
+        session, error = _load_session(data_root, session_id)
+        if error is not None:
+            return error
+        result = meta.summarize_session(session, scope)
+        return prompts.summary_result(session, result)
+
+    @mcp.tool()
+    def compress_history(
+        session_id: str, target_tokens: int = meta.DEFAULT_TARGET_TOKENS
+    ) -> dict[str, Any]:
+        """Deterministic extractive digest of *prior* stages' committed
+        thoughts, capped at `target_tokens` (a cheap len(text)//4 heuristic
+        -- no tokenizer dependency). The current stage is left out; its
+        detail is already visible via the live loop tools/
+        `summarize_session`. For small-context local models that can't
+        hold a whole session's history.
+        """
+        session, error = _load_session(data_root, session_id)
+        if error is not None:
+            return error
+        result = meta.compress_history(session, target_tokens)
+        return prompts.compression_result(session, result)
+
+    @mcp.tool()
+    def export_session(session_id: str) -> dict[str, Any]:
+        """Return this session's complete state as a JSON-serializable
+        dict, suitable for handing straight to `import_session`.
+        """
+        session, error = _load_session(data_root, session_id)
+        if error is not None:
+            return error
+        return prompts.session_exported(session, meta.export_session(session))
+
+    @mcp.tool()
+    def import_session(data: dict[str, Any] | str) -> dict[str, Any]:
+        """Recreate a session from a previous `export_session` payload (a
+        dict, or its JSON string form). Validated on the way in. If the
+        imported session's id collides with one already on this install, a
+        fresh id (and save path) is assigned automatically rather than
+        overwriting the existing session -- collision-safe import.
+        """
+        try:
+            session = meta.parse_import(data)
+        except meta.ImportValidationError as exc:
+            return prompts.import_failed(exc.code, exc.message)
+
+        id_reassigned = index.get(data_root, session.id) is not None
+        if id_reassigned:
+            session.id = uuid.uuid4().hex
+        session.save_path = str(store.session_path(data_root, session.id))
+        _persist(session)
+        return prompts.session_imported(session, id_reassigned)
+
+
 def create_server(root: Path | str | None = None) -> FastMCP:
     """Build a fresh `deep-think-mcp` FastMCP server instance.
 
@@ -468,6 +571,7 @@ def create_server(root: Path | str | None = None) -> FastMCP:
     _register_lifecycle_tools(mcp, data_root)
     _register_stage_tools(mcp, data_root)
     _register_serial_tools(mcp, data_root)
+    _register_meta_tools(mcp, data_root)
     return mcp
 
 
