@@ -673,8 +673,7 @@ _NEXT_ACTION_MESSAGES: dict[str, str] = {
         "call set_session_mode(session_id, mode)."
     ),
     "subagent_converged": (
-        "The Nash equilibrium is strong (the winning candidate's rating is at "
-        "or above the commit threshold). Call "
+        "The winning candidate has reached the commit threshold. Call "
         "commit_subagent_thought(session_id) to lock it in."
     ),
     "subagent_budget_exhausted": (
@@ -1075,6 +1074,10 @@ def _subagent_round_common(result: SubagentRoundResult) -> dict[str, Any]:
         "rounds_run": result.rounds_run,
         "max_rounds": result.max_rounds,
         "equilibrium_strength": round(result.strength, 3),
+        # The metric `equilibrium_strength` is measured in -- "peer rating"
+        # (necort, correctness dim) or "mean utility" (manual, 7-dim mean) --
+        # so the model reads the gate honestly per engine (T13 fix round 1).
+        "gate_metric": result.metric_label,
         "commit_threshold": result.threshold,
         "converged": result.converged,
         "budget_exhausted": result.budget_exhausted,
@@ -1085,11 +1088,14 @@ def _subagent_round_common(result: SubagentRoundResult) -> dict[str, Any]:
 
 
 def _subagent_next_step(result: SubagentRoundResult) -> tuple[str, str]:
-    """(next_tool, message) after a subagent round, from the equilibrium state."""
+    """(next_tool, message) after a subagent round, from the equilibrium state.
+    The wording names this engine's own gate metric (`result.metric_label`) so
+    a manual verdict says "mean utility" and a necort verdict "peer rating"."""
+    label = result.metric_label
     if result.converged:
         return (
             "commit_subagent_thought",
-            "The equilibrium is strong (winning candidate's rating "
+            f"The equilibrium is strong (winning candidate's {label} "
             f"{result.strength:.2f} >= threshold {result.threshold:.2f}). Accept "
             "it with commit_subagent_thought(session_id), or inspect it first "
             "with inspect_utility_matrix(session_id).",
@@ -1098,13 +1104,13 @@ def _subagent_next_step(result: SubagentRoundResult) -> tuple[str, str]:
         return (
             "commit_subagent_thought",
             f"The round budget (max_rounds={result.max_rounds}) is spent and the "
-            f"equilibrium's rating is {result.strength:.2f}. Accept it with "
-            "commit_subagent_thought(session_id).",
+            f"winning candidate's {label} is {result.strength:.2f}. Accept it "
+            "with commit_subagent_thought(session_id).",
         )
     return (
         "advance_subagent_round",
-        f"The equilibrium's rating ({result.strength:.2f}) is below the commit "
-        f"threshold ({result.threshold:.2f}) and rounds remain "
+        f"The winning candidate's {label} ({result.strength:.2f}) is below the "
+        f"commit threshold ({result.threshold:.2f}) and rounds remain "
         f"({result.rounds_run}/{result.max_rounds}). Refine it with "
         "advance_subagent_round(session_id), or accept it now with "
         "commit_subagent_thought(session_id).",
@@ -1142,6 +1148,7 @@ def subagent_matrix(session: Session, state: MatrixState) -> dict[str, Any]:
         "rounds_run": state.rounds_run,
         "max_rounds": state.max_rounds,
         "equilibrium_strength": round(state.strength, 3),
+        "gate_metric": state.metric_label,
         "commit_threshold": state.threshold,
         "converged": state.converged,
         "selected_content": state.selected_content,
@@ -1149,8 +1156,8 @@ def subagent_matrix(session: Session, state: MatrixState) -> dict[str, Any]:
         "next_tool": "commit_subagent_thought" if state.converged else "advance_subagent_round",
         "message": (
             f"Current equilibrium: {state.rounds_run}/{state.max_rounds} round(s) "
-            f"run, winning candidate rated {state.strength:.2f} (threshold "
-            f"{state.threshold:.2f})."
+            f"run, winning candidate's {state.metric_label} {state.strength:.2f} "
+            f"(threshold {state.threshold:.2f})."
         ),
     }
 

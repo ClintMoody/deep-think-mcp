@@ -31,6 +31,18 @@ def _forbid_vendored_load(monkeypatch):
     monkeypatch.setattr(necort_adapter, "_ensure_loaded", _boom)
 
 
+_DIMS = (
+    "correctness", "evidence", "novelty", "clarity",
+    "bias_resistance", "actionability", "coverage",
+)
+
+
+def _all(v: float) -> dict[str, float]:
+    """A full 7-dim score vector at `v` -- mean == v, so it clears the manual
+    mean gate when v >= threshold (T13 fix round 1: manual gates on the mean)."""
+    return {d: v for d in _DIMS}
+
+
 async def _call(client, name: str, arguments: dict[str, Any] | None = None) -> dict[str, Any]:
     result = await client.call_tool(name, arguments or {})
     assert not result.isError, result.content
@@ -68,11 +80,11 @@ async def test_full_manual_loop_begin_specialists_commit(tmp_path):
         assert begun["next_tool"] == "advance_subagent_round"
         assert "Analysis" in begun["specialist_prompt"]
 
-        # specialist 0 (Analysis) submits -> hands specialist 1 (Creativity)
+        # specialist 0 (Analysis) submits a strong full vector -> hands Creativity
         s1 = await _call(
             client,
             "advance_subagent_round",
-            {"session_id": sid, "candidate": "Analysis candidate", "scores": {"correctness": 0.9, "clarity": 0.8}},
+            {"session_id": sid, "candidate": "Analysis candidate", "scores": _all(0.9)},
         )
         assert s1["specialist"] == "Creativity"
         assert s1["specialist_index"] == 1
@@ -84,7 +96,9 @@ async def test_full_manual_loop_begin_specialists_commit(tmp_path):
             {"session_id": sid, "candidate": "Creativity candidate", "scores": {"correctness": 0.5}},
         )
         assert verdict["rounds_run"] == 1
-        assert verdict["converged"] is True  # Analysis winner corr 0.9 >= 0.75
+        # manual gates on the 7-dim MEAN: Analysis mean 0.9 >= 0.75 -> converged
+        assert verdict["converged"] is True
+        assert verdict["gate_metric"] == "mean utility"
         assert verdict["selected_content"] == "Analysis candidate"
         assert verdict["next_tool"] == "commit_subagent_thought"
 
@@ -112,11 +126,12 @@ async def test_manual_loop_accepts_mixed_tolerant_score_inputs(tmp_path):
         sid = await _start_manual(client, agents=["Analysis", "Creativity"])
 
         await _call(client, "begin_subagent_thought", {"session_id": sid, "content": "seed"})
-        # plaintext "k: v" scores
+        # plaintext "k: v" scores -- a strong full vector (mean 0.9)
+        a_plaintext = ", ".join(f"{d}: 0.9" for d in _DIMS)
         s1 = await _call(
             client,
             "advance_subagent_round",
-            {"session_id": sid, "candidate": "A", "scores": "correctness: 0.9, clarity: 0.8"},
+            {"session_id": sid, "candidate": "A", "scores": a_plaintext},
         )
         assert s1["specialist_index"] == 1
         # fenced-JSON-in-prose scores
@@ -125,7 +140,7 @@ async def test_manual_loop_accepts_mixed_tolerant_score_inputs(tmp_path):
             "advance_subagent_round",
             {"session_id": sid, "candidate": "C", "scores": "```json\n{\"correctness\": 0.4}\n```"},
         )
-        assert verdict["converged"] is True
+        assert verdict["converged"] is True  # A's mean 0.9 >= 0.75
         assert verdict["selected_content"] == "A"
 
     session = store.load(store.session_path(tmp_path, sid))
@@ -184,14 +199,14 @@ async def test_next_action_manual_rows(tmp_path):
         assert na["code"] == "subagent_awaiting_specialist"
         assert na["next_tool"] == "advance_subagent_round"
 
-        await _call(client, "advance_subagent_round", {"session_id": sid, "candidate": "A", "scores": {"correctness": 0.9}})
+        await _call(client, "advance_subagent_round", {"session_id": sid, "candidate": "A", "scores": _all(0.9)})
         na = await _call(client, "next_action", {"session_id": sid})
         # mid-round: still owes the 2nd specialist's candidate
         assert na["code"] == "subagent_awaiting_specialist"
 
         await _call(client, "advance_subagent_round", {"session_id": sid, "candidate": "C", "scores": {"correctness": 0.5}})
         na = await _call(client, "next_action", {"session_id": sid})
-        assert na["code"] == "subagent_converged"
+        assert na["code"] == "subagent_converged"  # A's mean 0.9 >= 0.75
         assert na["next_tool"] == "commit_subagent_thought"
 
 

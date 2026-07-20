@@ -64,6 +64,21 @@ def test_parse_string_list_rejects_wrong_type():
     assert exc.value.example
 
 
+def test_parse_string_list_trailing_comma_json_parses_correctly():
+    # Reviewer probe: '[..,]' must parse to the 2 clean members, NOT 3 corrupt
+    # structural stage names that also slip past the duplicate-stage guard.
+    assert tolerant.parse_string_list('["Analysis","Research",]', param="stages") == [
+        "Analysis",
+        "Research",
+    ]
+
+
+def test_parse_string_list_unterminated_json_reaches_retry_not_garbage():
+    with pytest.raises(TolerantParseError) as exc:
+        tolerant.parse_string_list('["Analysis","Research"', param="stages")
+    assert exc.value.param == "stages"
+
+
 # ---------------------------------------------------------------------------
 # parse_scores
 # ---------------------------------------------------------------------------
@@ -110,6 +125,24 @@ def test_parse_scores_empty_string_returns_empty_dict():
 def test_parse_scores_rejects_unparseable():
     with pytest.raises(TolerantParseError) as exc:
         tolerant.parse_scores("this has no numbers at all", param="scores")
+    assert exc.value.param == "scores"
+
+
+# --- trailing-comma JSON must parse correctly (layer a), not silently corrupt ---
+
+
+def test_parse_scores_trailing_comma_json_parses_correctly():
+    # Reviewer probe: json.loads rejects the trailing comma; the fix normalizes
+    # it away so the model's real intent (0.8) is recorded, NOT a neutral 0.5.
+    assert tolerant.parse_scores('{"correctness": 0.8,}', param="scores") == {"correctness": 0.8}
+
+
+def test_parse_scores_unterminated_json_reaches_retry_not_garbage(monkeypatch):
+    # Reviewer probe: still-malformed JSON must route to retry_with_clarification
+    # via the structural-punctuation guard, NOT produce a garbage '{"correctness"'
+    # key that the engine drops to a neutral 0.5.
+    with pytest.raises(TolerantParseError) as exc:
+        tolerant.parse_scores('{"correctness": 0.8', param="scores")
     assert exc.value.param == "scores"
 
 

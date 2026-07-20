@@ -57,6 +57,17 @@ adapter docstring / report):
     reports the equilibrium "converged" (commit); below it (with budget
     remaining) it recommends `advance`.
 
+Per-engine gate divergence (necort vs manual -- T13 fix round 1)
+----------------------------------------------------------------
+This correctness-dim gate is the NECORT gate. `manual_engine.py` (the
+endpoint-free path where the calling model scores all 7 dims for real) gates on
+the 7-dim MEAN instead -- the same metric its deterministic selection ranks by
+-- because in manual mode the mean carries genuine signal and can reach 0.75.
+Both engines resolve their metric through `strength_metric(cfg)` /
+`selected_strength(thought, metric)` here, so `loop_state` / `_round_result` /
+`inspect` (reused by manual) stay consistent, and the verdict wording names
+each engine's own metric (`metric_label`). See `manual_engine.py`'s docstring.
+
 
 Sequential vs multi-endpoint dispatch
 -------------------------------------
@@ -78,13 +89,56 @@ from typing import Any
 
 from deep_think_mcp import prompts, stages
 from deep_think_mcp.necort_adapter import NECoRTAdapter, NECoRTResult, NECoRTUnavailable
-from deep_think_mcp.serial_engine import DIMENSIONS, current_thought
-from deep_think_mcp.session import Session, SpecialistRound, Thought
+from deep_think_mcp.serial_engine import DIMENSIONS, current_thought, overall_score
+from deep_think_mcp.session import Session, SpecialistRound, Thought, UtilityScore
 
 # The populated dimension that carries the real Nash peer-rating signal (see
 # the module docstring's threshold section). correctness == clarity == coverage
 # by construction; we read correctness as the representative.
 _STRENGTH_DIM = "correctness"
+
+
+# ---------------------------------------------------------------------------
+# Per-engine commit-gate metric (T13 fix round 1)
+# ---------------------------------------------------------------------------
+# necort and manual gate convergence on DIFFERENT metrics, on purpose:
+#
+#   - necort: the winner's `correctness` dim -- the ONLY real Nash signal. The
+#     7-dim mean is structurally capped at (3*1.0 + 4*0.5)/7 == 0.714 (four
+#     dims are unpopulatable 0.5 sentinels; see necort_adapter.py), so a 0.75
+#     gate on the mean could never pass -- correctness is the honest metric.
+#   - manual: the winner's 7-dim MEAN (overall_score) -- the SAME metric the
+#     deterministic selection ranks by. In manual mode the model scores all
+#     seven dims for real, so the mean carries genuine signal and can reach the
+#     threshold; gating on it keeps "what we selected" and "what we commit on"
+#     one consistent quantity (T13 fix round 1 adjudication).
+#
+# `strength_metric(cfg)` resolves which to use from `[subagent].engine`;
+# `selected_strength(thought, metric)` reads it. Keeping this in one place
+# means `loop_state` / `_round_result` / `inspect` (and manual_engine, which
+# reuses `inspect`/`commit`) all agree on the gate per engine.
+METRIC_CORRECTNESS = "correctness"
+METRIC_MEAN = "mean"
+
+_METRIC_LABELS = {METRIC_CORRECTNESS: "peer rating", METRIC_MEAN: "mean utility"}
+
+
+def strength_metric(cfg: dict[str, Any]) -> str:
+    """The commit-gate metric for this session's subagent engine."""
+    return METRIC_MEAN if cfg.get("subagent", {}).get("engine") == "manual" else METRIC_CORRECTNESS
+
+
+def metric_label(metric: str) -> str:
+    """Human-readable name of a gate metric, for the verdict wording."""
+    return _METRIC_LABELS.get(metric, "rating")
+
+
+def _strength_of(score: UtilityScore, metric: str) -> float:
+    """The gate value of a `UtilityScore` under `metric`: the 7-dim mean for
+    manual, the populated `correctness` dim for necort."""
+    if metric == METRIC_MEAN:
+        return overall_score(score)
+    return float(getattr(score, _STRENGTH_DIM))
 
 
 class SubagentSequencingError(Exception):
@@ -132,6 +186,9 @@ class SubagentRoundResult:
     budget_exhausted: bool
     endpoints_used: int
     final_utility_scores: dict[str, float] = field(default_factory=dict)
+    # The gate metric this verdict's `strength` is measured in ("peer rating"
+    # for necort, "mean utility" for manual) -- so the wording names it honestly.
+    metric_label: str = "peer rating"
 
 
 @dataclass
@@ -145,6 +202,7 @@ class MatrixState:
     threshold: float
     converged: bool
     candidates: list[dict[str, Any]] = field(default_factory=list)
+    metric_label: str = "peer rating"
 
 
 # ---------------------------------------------------------------------------
@@ -206,15 +264,17 @@ def selected_round(thought: Thought) -> SpecialistRound | None:
     return max(winners, key=lambda r: r.round_index)
 
 
-def selected_strength(thought: Thought) -> float | None:
-    """The winning candidate's populated Nash dimension -- the quantity the
-    commit-gate `equilibrium_threshold` is compared against (see docstring)."""
+def selected_strength(thought: Thought, metric: str = METRIC_CORRECTNESS) -> float | None:
+    """The winning candidate's gate value under `metric` -- the quantity the
+    commit-gate `equilibrium_threshold` is compared against. `metric` is
+    `correctness` for necort (its only real signal) and `mean` for manual (the
+    7-dim mean it ranks selection by); see the per-engine gate note above."""
     if thought.final_utility_scores is not None:
-        return float(getattr(thought.final_utility_scores, _STRENGTH_DIM))
+        return _strength_of(thought.final_utility_scores, metric)
     winner = selected_round(thought)
     if winner is None:
         return None
-    return float(getattr(winner.utility_vector, _STRENGTH_DIM))
+    return _strength_of(winner.utility_vector, metric)
 
 
 def loop_state(session: Session, cfg: dict[str, Any]) -> str:
@@ -230,7 +290,7 @@ def loop_state(session: Session, cfg: dict[str, Any]) -> str:
     sub = cfg["subagent"]
     if rounds_run(thought) >= int(sub["max_rounds"]):
         return "budget_exhausted"
-    strength = selected_strength(thought)
+    strength = selected_strength(thought, strength_metric(cfg))
     if strength is not None and strength >= float(sub["equilibrium_threshold"]):
         return "converged"
     return "can_advance"
@@ -352,8 +412,9 @@ def _round_result(
     sub = cfg["subagent"]
     max_r = int(sub["max_rounds"])
     threshold = float(sub["equilibrium_threshold"])
+    metric = strength_metric(cfg)
     rr = rounds_run(thought)
-    strength = selected_strength(thought) or 0.0
+    strength = selected_strength(thought, metric) or 0.0
     winner = selected_round(thought)
     scores: dict[str, float] = {}
     if thought.final_utility_scores is not None:
@@ -370,6 +431,7 @@ def _round_result(
         budget_exhausted=rr >= max_r,
         endpoints_used=endpoints_used,
         final_utility_scores=scores,
+        metric_label=metric_label(metric),
     )
 
 
@@ -470,7 +532,8 @@ def inspect(session: Session, cfg: dict[str, Any]) -> MatrixState:
         for r in latest
     ]
     winner = selected_round(thought)
-    strength = selected_strength(thought) or 0.0
+    metric = strength_metric(cfg)
+    strength = selected_strength(thought, metric) or 0.0
     threshold = float(sub["equilibrium_threshold"])
     return MatrixState(
         thought_id=thought.id,
@@ -482,6 +545,7 @@ def inspect(session: Session, cfg: dict[str, Any]) -> MatrixState:
         threshold=threshold,
         converged=strength >= threshold,
         candidates=candidates,
+        metric_label=metric_label(metric),
     )
 
 

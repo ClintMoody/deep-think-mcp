@@ -52,10 +52,21 @@ coverage, from the single blended Nash rating) and the other four are neutral
 0.5 sentinels (see `necort_adapter.py`). In MANUAL mode the model CAN and DOES
 score all seven dimensions for real -- so the deterministic selection here
 ranks candidates by the **mean of all seven** submitted scores (highest wins,
-ties -> the first/earliest specialist). The commit gate still reads the
-`correctness` dim (T11's semantic) so the two engines agree on what "strong
-enough to commit" means, but the *selection* uses the full seven-dim mean that
-only manual mode can populate honestly.
+ties -> the first/earliest specialist).
+
+Per-engine commit-gate metric (T13 fix round 1)
+-----------------------------------------------
+Manual gates convergence on the SAME metric its selection uses: the 7-dim MEAN
+(`overall_score`) vs `equilibrium_threshold`. This diverges DELIBERATELY from
+necort, which gates on the winner's `correctness` dim -- necort's only real
+signal, whose 7-dim mean is structurally capped at 0.714 and so could never
+clear a 0.75 gate (see `subagent_engine.py`'s "Per-engine gate divergence"
+note). Because manual scores all seven dims for real, its mean carries genuine
+signal and can reach the threshold, and gating on it keeps "what we selected"
+and "what we commit on" one consistent quantity. The verdict wording names the
+metric honestly per engine ("winning candidate's mean utility X >= threshold Y"
+for manual). Both engines resolve the metric through
+`subagent_engine.strength_metric(cfg)` / `selected_strength(thought, metric)`.
 """
 
 from __future__ import annotations
@@ -67,9 +78,11 @@ from deep_think_mcp import prompts, stages
 from deep_think_mcp.serial_engine import DIMENSIONS, current_thought, overall_score
 from deep_think_mcp.session import Session, SpecialistRound, Thought, UtilityScore
 from deep_think_mcp.subagent_engine import (
+    METRIC_MEAN,
     SubagentAdapterError,
     SubagentRoundResult,
     SubagentSequencingError,
+    metric_label,
     rounds_run,
     selected_round,
     selected_strength,
@@ -247,7 +260,10 @@ def _round_result(thought: Thought, cfg: dict[str, Any]) -> SubagentRoundResult:
     max_r = int(sub["max_rounds"])
     threshold = float(sub["equilibrium_threshold"])
     rr = rounds_run(thought)
-    strength = selected_strength(thought) or 0.0
+    # Manual gates on the SAME metric its selection ranks by: the 7-dim MEAN
+    # (all seven are real here), NOT correctness -- see the module docstring's
+    # per-engine divergence note (T13 fix round 1).
+    strength = selected_strength(thought, METRIC_MEAN) or 0.0
     winner = selected_round(thought)
     scores: dict[str, float] = {}
     if thought.final_utility_scores is not None:
@@ -264,6 +280,7 @@ def _round_result(thought: Thought, cfg: dict[str, Any]) -> SubagentRoundResult:
         budget_exhausted=rr >= max_r,
         endpoints_used=0,
         final_utility_scores=scores,
+        metric_label=metric_label(METRIC_MEAN),
     )
 
 
@@ -292,7 +309,8 @@ def loop_state(session: Session, cfg: dict[str, Any]) -> str:
     # A round just closed (rr >= 1, none submitted into the next round yet).
     if rr >= int(sub["max_rounds"]):
         return "budget_exhausted"
-    strength = selected_strength(thought)
+    # Gate on the 7-dim MEAN (the metric selection uses), not correctness.
+    strength = selected_strength(thought, METRIC_MEAN)
     if strength is not None and strength >= float(sub["equilibrium_threshold"]):
         return "converged"
     return "can_advance"

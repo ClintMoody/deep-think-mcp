@@ -112,8 +112,11 @@ def test_advance_walks_roster_then_closes_round():
     # highest MEAN of the 7 dims wins -> Creativity (corr 0.9, rest 0.5) beats
     # Analysis (0.6) and Skeptic (0.4).
     assert verdict.selected_content == "cand-C"
-    assert verdict.strength == pytest.approx(0.9)  # commit gate reads correctness
-    assert verdict.converged is True  # 0.9 >= 0.75
+    # The commit gate reads the SAME 7-dim MEAN selection uses (T13 fix round 1),
+    # NOT correctness. Creativity's mean = (0.9 + 6*0.5)/7 ~= 0.557 < 0.75.
+    assert verdict.strength == pytest.approx((0.9 + 6 * 0.5) / 7)
+    assert verdict.converged is False
+    assert verdict.metric_label == "mean utility"
 
 
 def test_selection_is_highest_mean_ties_go_to_first():
@@ -223,6 +226,42 @@ def test_no_specialists_configured_is_a_directive_not_a_crash():
     cfg = _cfg(agents=[])
     with pytest.raises(subagent_engine.SubagentAdapterError):
         manual_engine.begin(session, "seed", None, cfg)
+
+
+def _full(**dims):
+    base = {d: 0.5 for d in (
+        "correctness", "evidence", "novelty", "clarity",
+        "bias_resistance", "actionability", "coverage",
+    )}
+    base.update(dims)
+    return base
+
+
+def test_manual_gate_uses_the_seven_dim_mean_not_correctness():
+    """T13 fix round 1 adjudication: manual gates on the 7-dim MEAN, the same
+    metric selection uses -- NOT correctness (that stays necort's gate)."""
+    cfg = _cfg(max_rounds=2, threshold=0.75, agents=["Solo"])
+
+    # (a) mean 0.8 but correctness only 0.6 -> CONVERGES in manual mode
+    #     (would NOT converge under a correctness gate).
+    s1 = _session()
+    manual_engine.begin(s1, "seed", None, cfg)
+    high_mean_low_corr = _full(
+        correctness=0.6, evidence=0.85, novelty=0.85, clarity=0.85,
+        bias_resistance=0.85, actionability=0.85, coverage=0.85,
+    )  # mean = (0.6 + 6*0.85)/7 = 0.814
+    v1 = manual_engine.advance(s1, "cand", high_mean_low_corr, cfg)
+    assert v1.converged is True
+    assert v1.strength == pytest.approx((0.6 + 6 * 0.85) / 7)
+
+    # (b) the inverse -- correctness 0.9 but mean well below threshold -> does
+    #     NOT converge (proves the gate is not reading correctness).
+    s2 = _session()
+    manual_engine.begin(s2, "seed", None, cfg)
+    high_corr_low_mean = _full(correctness=0.9)  # rest 0.5 -> mean 0.557
+    v2 = manual_engine.advance(s2, "cand", high_corr_low_mean, cfg)
+    assert v2.converged is False
+    assert v2.strength == pytest.approx((0.9 + 6 * 0.5) / 7)
 
 
 def test_utility_from_scores_defaults_and_clamps():

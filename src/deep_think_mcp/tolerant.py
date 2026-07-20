@@ -42,9 +42,30 @@ _FENCE_RE = re.compile(r"```(?:json)?\s*(.*?)\s*```", re.DOTALL | re.IGNORECASE)
 # the outside, but balanced enough for the flat score/override objects we
 # accept -- we only ever json.loads the captured span, which validates it).
 _OBJECT_RE = re.compile(r"\{.*\}", re.DOTALL)
+# A trailing comma just before a closing brace/bracket (`,}` / `,]`, whitespace
+# allowed) -- the single most common weak-model JSON defect. `json.loads`
+# rejects it outright, so we normalize it away before parsing so genuine
+# (if slightly-malformed) JSON parses correctly rather than silently falling
+# through to the plaintext path and corrupting the data.
+_TRAILING_COMMA_RE = re.compile(r",(\s*[}\]])")
+# JSON structural punctuation. If any of these survives into a plaintext
+# fallback key/member, the input was really broken JSON masquerading as
+# plaintext (e.g. an unterminated object) -- we REJECT it to a
+# retry_with_clarification rather than emit a garbage key/member from it.
+_STRUCTURAL_CHARS = frozenset('{}[]"')
 
 _TRUE_WORDS = {"true", "t", "yes", "y", "1", "on"}
 _FALSE_WORDS = {"false", "f", "no", "n", "0", "off"}
+
+
+def _strip_trailing_commas(text: str) -> str:
+    """Remove trailing commas immediately before a closing `}`/`]`."""
+    return _TRAILING_COMMA_RE.sub(r"\1", text)
+
+
+def _has_structural_punctuation(text: str) -> bool:
+    """True if `text` contains any JSON structural punctuation ({ } [ ] ")."""
+    return any(ch in _STRUCTURAL_CHARS for ch in text)
 
 
 class TolerantParseError(Exception):
@@ -85,10 +106,14 @@ def _try_extract_json(text: str) -> Any | None:
         candidate = candidate.strip()
         if not candidate:
             continue
-        try:
-            return json.loads(candidate)
-        except (ValueError, TypeError):
-            continue
+        # Try the candidate as-is, then with trailing commas normalized away
+        # (`,}`/`,]` -> `}`/`]`). dict.fromkeys dedupes when normalization is
+        # a no-op so we never json.loads the identical text twice.
+        for variant in dict.fromkeys((candidate, _strip_trailing_commas(candidate))):
+            try:
+                return json.loads(variant)
+            except (ValueError, TypeError):
+                continue
     return None
 
 
@@ -97,13 +122,24 @@ def _try_extract_json(text: str) -> Any | None:
 # ---------------------------------------------------------------------------
 
 
+_LIST_EXPECTED = "a JSON array of strings, or a comma/newline-separated list"
+_LIST_EXAMPLE = '["assumption A", "assumption B"]  (or:  assumption A, assumption B)'
+
+
 def parse_string_list(raw: Any, *, param: str) -> list[str] | None:
     """Normalize `raw` into a `list[str]` (or None if `raw` is None).
 
     Accepts: a real list (members coerced to str); a JSON-array string
-    (`'["a", "b"]'`); or a plain comma/newline-separated string
-    (`"a, b, c"`). Blank members are dropped. An empty/whitespace string
-    yields `[]`. Anything else raises `TolerantParseError`.
+    (`'["a", "b"]'`, including a trailing-comma `'[..,]'` -- normalized); or a
+    plain comma/newline-separated string (`"a, b, c"`). Blank members are
+    dropped, an empty/whitespace string yields `[]`.
+
+    A plaintext member that still carries JSON structural punctuation
+    ({ } [ ] ") is REJECTED to `TolerantParseError` rather than emitted as a
+    corrupt member: that only happens when the input was broken JSON (e.g. an
+    unterminated array) that neither `json.loads` nor the trailing-comma
+    normalization could recover -- and a silent corrupt list would slip past
+    the duplicate-stage guard downstream.
     """
     if raw is None:
         return None
@@ -118,12 +154,11 @@ def parse_string_list(raw: Any, *, param: str) -> list[str] | None:
             return [str(item) for item in extracted]
         # Plaintext fallback: split on newlines and commas.
         parts = [piece.strip() for piece in re.split(r"[,\n]", stripped)]
-        return [piece for piece in parts if piece]
-    raise TolerantParseError(
-        param,
-        expected="a JSON array of strings, or a comma/newline-separated list",
-        example='["assumption A", "assumption B"]  (or:  assumption A, assumption B)',
-    )
+        parts = [piece for piece in parts if piece]
+        if any(_has_structural_punctuation(piece) for piece in parts):
+            raise TolerantParseError(param, expected=_LIST_EXPECTED, example=_LIST_EXAMPLE)
+        return parts
+    raise TolerantParseError(param, expected=_LIST_EXPECTED, example=_LIST_EXAMPLE)
 
 
 # ---------------------------------------------------------------------------
@@ -156,20 +191,28 @@ def parse_scores(raw: Any, *, param: str = "scores") -> dict[str, Any]:
         extracted = _try_extract_json(stripped)
         if isinstance(extracted, dict):
             return extracted
-        parsed = _parse_score_pairs(stripped)
+        parsed = _parse_score_pairs(stripped, param)  # may raise on structural garbage
         if parsed:
             return parsed
         raise TolerantParseError(param, expected=_SCORES_EXPECTED, example=_SCORES_EXAMPLE)
     raise TolerantParseError(param, expected=_SCORES_EXPECTED, example=_SCORES_EXAMPLE)
 
 
-def _parse_score_pairs(text: str) -> dict[str, float]:
+def _parse_score_pairs(text: str, param: str) -> dict[str, float]:
     """Parse `"correctness: 0.8, clarity: 0.7"` style pairs into a dict.
 
     Splits on commas and newlines, then each piece on its first ':'. Values
     that don't parse as a float are skipped (the caller raises if nothing at
     all parsed). Keys are left exactly as written -- the engine's own score
     merge normalizes them (lowercasing, '-'/' ' -> '_').
+
+    A key that carries JSON structural punctuation ({ } [ ] ") is REJECTED to
+    `TolerantParseError`: that key can only arise from broken JSON that
+    `json.loads` + trailing-comma normalization couldn't recover (e.g. an
+    unterminated `'{"correctness": 0.8'`), where the partition on ':' yields a
+    garbage key like `{"correctness"`. Emitting it would silently distort the
+    score vector (the engine drops the unknown key -> a neutral 0.5) -- the
+    exact never-silent-default violation this must not commit.
     """
     out: dict[str, float] = {}
     for piece in re.split(r"[,\n]", text):
@@ -179,6 +222,8 @@ def _parse_score_pairs(text: str) -> dict[str, float]:
         key = key.strip()
         if not key:
             continue
+        if _has_structural_punctuation(key):
+            raise TolerantParseError(param, expected=_SCORES_EXPECTED, example=_SCORES_EXAMPLE)
         try:
             out[key] = float(value.strip())
         except (TypeError, ValueError):
