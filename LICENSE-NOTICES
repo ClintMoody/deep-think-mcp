@@ -1,0 +1,36 @@
+Third-party notices for deep-think-mcp
+=======================================
+
+This project vendors third-party source code as a git submodule. That
+code retains its own license and is not relicensed by inclusion here.
+
+vendor/necort/
+---------------
+
+Source: https://github.com/PhialsBasement/Chain-of-Recursive-Thoughts
+Vendored via: git submodule, pinned to commit
+    f4d290ceb086d47bb0f872164344836c47134452
+    (head of refs/pull/7/head, PR #7, "feat: Add Enhanced Implementations
+    for NECoRT")
+
+License: MIT License
+
+Copyright (c) 2025 PhialsBasement
+Copyright (c) 2025 Faramarz Hashemi - Nash Equilibrium Integration
+
+The full, authoritative license text is vendored in place and travels
+with the pinned commit at:
+
+    vendor/necort/LICENSE
+
+It is not reproduced in full here to avoid the two copies drifting when
+the submodule is re-pinned (see docs/repinning_necort.md); this notice
+exists to make the third-party attribution visible at the top level of
+this repository without requiring a checkout of the submodule.
+
+Of the vendored tree, this project imports and uses only:
+    vendor/necort/recursive_thinking_ai.py
+    vendor/necort/nash_recursive_thinking.py
+(see docs/necort_deps.md for the scoping rationale). The MIT license
+covers the entire vendored repository regardless of which files are
+actually used.

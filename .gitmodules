@@ -1,0 +1,3 @@
+[submodule "vendor/necort"]
+	path = vendor/necort
+	url = https://github.com/PhialsBasement/Chain-of-Recursive-Thoughts
