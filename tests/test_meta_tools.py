@@ -199,6 +199,74 @@ async def test_next_action_finalized_and_kept_reports_complete(tmp_path):
 
 
 # ---------------------------------------------------------------------------
+# Fix round 1 (reviewer-flagged, Important): move_session/keep_here are
+# deliberately status-independent (docs/execution-plan.md Task 12 -- "the
+# move machinery is status-independent"), so calling either on a still-
+# ACTIVE session records a real MoveRecord/DecisionRecord. A later
+# finalize_session must still surface its own move/keep prompt -- an
+# earlier decision must not be silently read as having already answered
+# it. Regression tests for the reviewer's exact probe, plus confirmation
+# that the intended flow (finalize, THEN move/keep) still settles.
+# ---------------------------------------------------------------------------
+
+
+async def test_next_action_move_before_finalize_still_prompts_for_decision(tmp_path):
+    """Reviewer probe: move-before-finalize previously returned
+    'session_complete' (wrong); must return 'await_move_decision'.
+    """
+    dest = tmp_path / "elsewhere" / "moved.json"
+    dest.parent.mkdir(parents=True)
+
+    srv = server.create_server(root=tmp_path)
+    async with create_connected_server_and_client_session(srv) as client:
+        sid = await _start_serial(client)
+        await _call(
+            client, "move_session", {"session_id": sid, "new_path": str(dest)}
+        )
+        await _call(client, "finalize_session", {"session_id": sid})
+
+        payload = await _call(client, "next_action", {"session_id": sid})
+
+    assert payload["code"] == "await_move_decision"
+    assert payload["next_tool"] == "move_session"
+
+
+async def test_next_action_keep_here_before_finalize_still_prompts_for_decision(tmp_path):
+    srv = server.create_server(root=tmp_path)
+    async with create_connected_server_and_client_session(srv) as client:
+        sid = await _start_serial(client)
+        await _call(client, "keep_here", {"session_id": sid})
+        await _call(client, "finalize_session", {"session_id": sid})
+
+        payload = await _call(client, "next_action", {"session_id": sid})
+
+    assert payload["code"] == "await_move_decision"
+    assert payload["next_tool"] == "move_session"
+
+
+async def test_next_action_finalize_then_move_reports_complete(tmp_path):
+    """Existing behavior preserved: a move AFTER finalize -- the flow
+    finalize_session's prompt is actually meant to trigger -- still
+    settles the session.
+    """
+    dest = tmp_path / "elsewhere" / "moved.json"
+    dest.parent.mkdir(parents=True)
+
+    srv = server.create_server(root=tmp_path)
+    async with create_connected_server_and_client_session(srv) as client:
+        sid = await _start_serial(client)
+        await _call(client, "finalize_session", {"session_id": sid})
+        await _call(
+            client, "move_session", {"session_id": sid, "new_path": str(dest)}
+        )
+
+        payload = await _call(client, "next_action", {"session_id": sid})
+
+    assert payload["code"] == "session_complete"
+    assert payload["next_tool"] is None
+
+
+# ---------------------------------------------------------------------------
 # summarize_session
 # ---------------------------------------------------------------------------
 

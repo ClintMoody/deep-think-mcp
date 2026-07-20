@@ -62,6 +62,7 @@ the server that deletes/moves files based on tool input:
 from __future__ import annotations
 
 import os
+from datetime import datetime, timezone
 from pathlib import Path
 
 from deep_think_mcp import store
@@ -82,8 +83,16 @@ class MoveError(Exception):
 
 
 def finalize(session: Session) -> Session:
-    """Mark `session` finalized. Pure mutation; caller persists."""
+    """Mark `session` finalized. Pure mutation; caller persists.
+
+    Also records `finalized_at` (timezone-aware UTC, same convention
+    `session.py`'s own `_utcnow()` uses) -- the cutoff `meta.next_action`
+    needs to tell a move/keep decision made in answer to this finalize's
+    own move/keep prompt apart from an earlier one made while the session
+    was still active (Task 8 fix round 1).
+    """
     session.status = "finalized"
+    session.finalized_at = datetime.now(timezone.utc)
     return session
 
 

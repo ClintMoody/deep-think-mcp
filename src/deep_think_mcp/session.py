@@ -127,6 +127,15 @@ class Session(BaseModel):
     current_stage: str
     current_thought_id: str | None = None
     status: Literal["active", "finalized", "archived"] = "active"
+    # When `status` became "finalized" (set by `lifecycle.finalize()`).
+    # None for a session finalized before this field existed, or never
+    # finalized. [derived, task 8 fix round 1]: next_action() uses this as
+    # the cutoff for "was a move_session/keep_here decision made in answer
+    # to finalize's own move/keep prompt" -- move_session/keep_here are
+    # deliberately status-independent (docs/execution-plan.md Task 12), so
+    # an earlier decision on a still-active session must not be mistaken
+    # for an answer to a prompt that hadn't been asked yet.
+    finalized_at: datetime | None = None
     save_path: str = ""
     # Raw per-session config overrides dict as passed to start_session(),
     # e.g. {"serial": {"max_rounds": 1}} -- Global Constraints requires

@@ -5,6 +5,8 @@ validation constraints, and roundtrips (model -> JSON -> model) for both
 execution modes, per the brief's test list ("model roundtrips").
 """
 
+import json
+
 import pytest
 from pydantic import ValidationError
 
@@ -62,12 +64,34 @@ def test_session_defaults():
     assert session.mode is None
     assert session.status == "active"
     assert session.current_thought_id is None
+    assert session.finalized_at is None
     assert session.save_path == ""
     assert session.overrides == {}
     assert session.move_history == []
     assert session.thoughts == []
     assert session.decisions == []
     assert session.created_at is not None
+
+
+def test_session_json_without_finalized_at_still_loads():
+    """Backward compatibility (Task 8 fix round 1): `finalized_at` was
+    added additively after sessions with the earlier schema may already
+    exist on disk. JSON lacking the key entirely must still load, with
+    `finalized_at` defaulting to None.
+    """
+    session = Session(
+        question="q",
+        expected_stages=["Research"],
+        current_stage="Research",
+        status="finalized",
+    )
+    data = json.loads(session.model_dump_json())
+    assert "finalized_at" in data  # sanity: the current schema does emit it
+    del data["finalized_at"]  # simulate JSON written before this field existed
+
+    restored = Session.model_validate(data)
+    assert restored.finalized_at is None
+    assert restored.status == "finalized"
 
 
 # ---------------------------------------------------------------------------

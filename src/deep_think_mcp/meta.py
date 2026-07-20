@@ -65,6 +65,37 @@ class NextAction:
     detail: dict[str, Any] = field(default_factory=dict)
 
 
+def _has_post_finalize_decision(session: Session) -> bool:
+    """Whether a `move_session`/`keep_here` decision was made AT OR AFTER
+    `session.finalized_at` -- i.e. actually in answer to `finalize_
+    session`'s own move/keep prompt, not an earlier decision recorded
+    while the session was still active.
+
+    `move_session`/`keep_here` are deliberately status-independent
+    (`docs/execution-plan.md` Task 12: "the move machinery is status-
+    independent"), so a `MoveRecord`/`DecisionRecord` can predate
+    finalization. Only entries timestamped at-or-after `finalized_at`
+    count as an answer to finalize's prompt (Task 8 fix round 1: the
+    review-flagged bug was counting ANY prior decision, which silently
+    skipped the prompt when a move/keep happened before finalize_session).
+
+    `finalized_at` is `None` for a session finalized before this field
+    existed (or never finalized through `lifecycle.finalize`, e.g. a
+    hand-edited/imported session). With no reliable cutoff to compare
+    against, this falls back to "any decision at all" -- the pre-fix
+    behavior -- rather than treating every such session as permanently
+    undecided.
+    """
+    if session.finalized_at is None:
+        return bool(session.move_history) or any(
+            d.action == "keep_here" for d in session.decisions
+        )
+    cutoff = session.finalized_at
+    return any(m.timestamp >= cutoff for m in session.move_history) or any(
+        d.action == "keep_here" and d.timestamp >= cutoff for d in session.decisions
+    )
+
+
 def next_action(session: Session, cfg: dict[str, Any]) -> NextAction:
     """Resolve the exact next tool to call for `session`, given its
     persisted state and mode. Authoritative: a weak local model should
@@ -97,10 +128,18 @@ def next_action(session: Session, cfg: dict[str, Any]) -> NextAction:
             the alternative -- two legitimate next steps, same fork
             `prompts.thought_committed` already documents)
       - serial mode, `status == "finalized"`:
-          - the move decision hasn't been made yet (no `move_history` and
-            no `keep_here` in `decisions`) -> `move_session` (with
-            `keep_here` as the alternative)
-          - already decided -> nothing left to do
+          - no move_session/keep_here decision was made AT OR AFTER
+            `finalized_at` -> `move_session` (with `keep_here` as the
+            alternative). `move_session`/`keep_here` are deliberately
+            status-independent (`docs/execution-plan.md` Task 12: "the
+            move machinery is status-independent"), so an earlier
+            decision made while the session was still active does NOT
+            count -- it wasn't an answer to this finalize's prompt (Task
+            8 fix round 1: this was previously computed as "any decision
+            ever", which silently skipped the prompt when a move/keep
+            happened before finalize_session).
+          - a decision was made at-or-after `finalized_at` -> nothing
+            left to do
       - `status == "archived"` -> nothing left to do (no tool sets this
         status today; handled for completeness since the schema allows it)
 
@@ -118,10 +157,7 @@ def next_action(session: Session, cfg: dict[str, Any]) -> NextAction:
 
     # session.mode == "serial" from here on.
     if session.status == "finalized":
-        decided = bool(session.move_history) or any(
-            d.action == "keep_here" for d in session.decisions
-        )
-        if decided:
+        if _has_post_finalize_decision(session):
             return NextAction("session_complete", None)
         return NextAction(
             "await_move_decision", "move_session", {"alternative_tool": "keep_here"}

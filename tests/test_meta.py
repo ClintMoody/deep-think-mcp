@@ -10,6 +10,8 @@ in `test_meta_tools.py`.
 
 from __future__ import annotations
 
+from datetime import datetime, timezone
+
 import pytest
 
 from deep_think_mcp import meta, serial_engine
@@ -199,24 +201,71 @@ def test_next_action_finalized_undecided_directs_move_or_keep():
     assert result.detail["alternative_tool"] == "keep_here"
 
 
-def test_next_action_finalized_kept_reports_session_complete():
+def test_next_action_finalized_kept_after_finalize_reports_session_complete():
     from deep_think_mcp.session import DecisionRecord
 
     session = _session(status="finalized")
-    session.decisions.append(DecisionRecord(action="keep_here"))
+    session.finalized_at = datetime.now(timezone.utc)
+    session.decisions.append(DecisionRecord(action="keep_here"))  # after finalized_at
     result = meta.next_action(session, _cfg())
     assert result.code == "session_complete"
     assert result.next_tool is None
 
 
-def test_next_action_finalized_and_moved_reports_session_complete():
+def test_next_action_finalized_and_moved_after_finalize_reports_session_complete():
+    from deep_think_mcp.session import MoveRecord
+
+    session = _session(status="finalized")
+    session.finalized_at = datetime.now(timezone.utc)
+    session.move_history.append(MoveRecord(from_path="/a", to_path="/b"))  # after
+    result = meta.next_action(session, _cfg())
+    assert result.code == "session_complete"
+    assert result.next_tool is None
+
+
+def test_next_action_decision_before_finalize_is_not_counted_as_decided():
+    """The reviewer-flagged bug (Task 8 fix round 1), pinned at the pure-
+    logic level: move_session/keep_here are status-independent (Task 12),
+    so a decision recorded while the session was still active must NOT be
+    mistaken for an answer to finalize_session's own move/keep prompt.
+    """
+    from deep_think_mcp.session import DecisionRecord
+
+    session = _session(status="finalized")
+    session.decisions.append(DecisionRecord(action="keep_here"))  # while still "active"
+    session.finalized_at = datetime.now(timezone.utc)  # finalized AFTER the decision
+
+    result = meta.next_action(session, _cfg())
+    assert result.code == "await_move_decision"
+    assert result.next_tool == "move_session"
+
+
+def test_next_action_move_before_finalize_is_not_counted_as_decided():
     from deep_think_mcp.session import MoveRecord
 
     session = _session(status="finalized")
     session.move_history.append(MoveRecord(from_path="/a", to_path="/b"))
+    session.finalized_at = datetime.now(timezone.utc)  # finalized AFTER the move
+
+    result = meta.next_action(session, _cfg())
+    assert result.code == "await_move_decision"
+    assert result.next_tool == "move_session"
+
+
+def test_next_action_finalized_with_no_finalized_at_falls_back_to_any_decision():
+    """A session finalized before `finalized_at` existed (or never routed
+    through `lifecycle.finalize`) has no reliable cutoff -- falls back to
+    the pre-fix "any decision at all" behavior rather than being stuck
+    permanently undecided.
+    """
+    from deep_think_mcp.session import DecisionRecord
+
+    session = _session(status="finalized")
+    session.decisions.append(DecisionRecord(action="keep_here"))
+    assert session.finalized_at is None
+
     result = meta.next_action(session, _cfg())
     assert result.code == "session_complete"
-    assert result.next_tool is None
 
 
 def test_next_action_archived_reports_no_further_action():
