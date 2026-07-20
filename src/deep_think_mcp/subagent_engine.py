@@ -87,7 +87,7 @@ import asyncio
 from dataclasses import dataclass, field
 from typing import Any
 
-from deep_think_mcp import prompts, stages
+from deep_think_mcp import config, prompts, stages
 from deep_think_mcp.necort_adapter import NECoRTAdapter, NECoRTResult, NECoRTUnavailable
 from deep_think_mcp.serial_engine import DIMENSIONS, current_thought, overall_score
 from deep_think_mcp.session import Session, SpecialistRound, Thought, UtilityScore
@@ -234,6 +234,12 @@ def _make_adapter(base_url: str, cfg: dict[str, Any], agent_roles: list[str]) ->
     """
     sub = cfg.get("subagent", {})
     api_key = str(sub.get("api_key", "") or "") or None
+    # [F7 SECURITY] The operator's api_key travels ONLY to operator-configured
+    # endpoints. If `base_url` is here only because a per-session override
+    # redirected the endpoint, run keyless -- never leak the operator's
+    # credential to a caller-chosen URL.
+    if api_key is not None and not config.api_key_allowed_for(cfg, "subagent", base_url):
+        api_key = None
     return NECoRTAdapter(
         base_url=base_url,
         model=str(sub.get("model", "") or ""),

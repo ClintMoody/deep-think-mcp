@@ -57,7 +57,15 @@ import asyncio
 from dataclasses import dataclass, field
 from typing import Any
 
-from deep_think_mcp import manual_engine, meta, prompts, serial_engine, subagent_engine, tolerant
+from deep_think_mcp import (
+    config,
+    manual_engine,
+    meta,
+    prompts,
+    serial_engine,
+    subagent_engine,
+    tolerant,
+)
 
 # Bounded retry budget for parsing the LLM's structured (score) output before
 # giving up with a partial-progress directive. Config-free constant, per the
@@ -153,9 +161,15 @@ def client_from_cfg(cfg: dict[str, Any]) -> ChatClient:
     `AutopilotHttpxMissing`, which the tool turns into a clean directive."""
     _import_httpx()  # fail fast if the optional extra is absent
     ap = cfg.get("autopilot", {})
+    endpoint = str(ap.get("endpoint", "") or "")
     api_key = str(ap.get("api_key", "") or "") or None
+    # [F7 SECURITY] The operator's api_key travels ONLY to the operator-
+    # configured endpoint. If a per-session override redirected `endpoint`,
+    # run keyless -- never leak the operator's credential to a caller-chosen URL.
+    if api_key is not None and not config.api_key_allowed_for(cfg, "autopilot", endpoint):
+        api_key = None
     return ChatClient(
-        endpoint=str(ap.get("endpoint", "") or ""),
+        endpoint=endpoint,
         model=str(ap.get("model", "") or ""),
         temperature=float(ap.get("temperature", 0.7)),
         api_key=api_key,

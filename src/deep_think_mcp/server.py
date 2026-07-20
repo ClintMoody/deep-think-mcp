@@ -31,6 +31,7 @@ from __future__ import annotations
 
 import asyncio
 import functools
+import re
 import uuid
 from pathlib import Path
 from typing import Any, Callable, Literal
@@ -57,6 +58,13 @@ from deep_think_mcp.session import Session
 from deep_think_mcp.tolerant import TolerantParseError
 
 SERVER_NAME = "deep-think-mcp"
+
+# [F6 SECURITY] A session id is used verbatim to build the on-disk save path
+# (`store.session_path`). Only a plain token (letters/digits) is accepted on
+# import, so a crafted id can never smuggle path separators or `..` that would
+# let the write escape the data root's `sessions/` dir. Every id this server
+# mints is `uuid4().hex`, which matches.
+_SAFE_SESSION_ID_RE = re.compile(r"\A[A-Za-z0-9]+\Z")
 
 
 def _load_session(
@@ -877,10 +885,33 @@ def _register_meta_tools(mcp: FastMCP, data_root: Path) -> None:
         except meta.ImportValidationError as exc:
             return prompts.import_failed(exc.code, exc.message)
 
+        # [F6 SECURITY] Validate the imported id BEFORE it can be used to
+        # compute an on-disk path -- reject anything that isn't a plain token
+        # (path-traversal / absolute-path id).
+        if not _SAFE_SESSION_ID_RE.match(session.id):
+            return prompts.retry_with_clarification(
+                "id",
+                expected=(
+                    "a plain session id token (letters and digits only, no "
+                    "path separators or dots)"
+                ),
+                example='"3f9a2c1b8e7d4f60a1b2c3d4e5f60718"',
+            )
+
         id_reassigned = index.get(data_root, session.id) is not None
         if id_reassigned:
             session.id = uuid.uuid4().hex
-        session.save_path = str(store.session_path(data_root, session.id))
+        save_path = store.session_path(data_root, session.id)
+        # [F6 SECURITY] Defense-in-depth: regardless of id, the computed save
+        # path MUST resolve inside the data root's sessions dir.
+        sessions_dir = (data_root / "sessions").resolve()
+        if not save_path.resolve().is_relative_to(sessions_dir):
+            return prompts.import_failed(
+                "invalid_session_data",
+                "the imported session id resolves to a path outside the "
+                "session store and was rejected.",
+            )
+        session.save_path = str(save_path)
         _persist(session)
         return prompts.session_imported(session, id_reassigned)
 

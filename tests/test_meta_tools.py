@@ -8,6 +8,7 @@ on its own fresh `tmp_path` root.
 
 from __future__ import annotations
 
+from pathlib import Path
 from typing import Any
 
 from mcp.shared.memory import create_connected_server_and_client_session
@@ -450,3 +451,77 @@ async def test_import_session_schema_violation_returns_clean_error(tmp_path):
             client, "import_session", {"data": {"question": "q", "mode": "not-a-mode"}}
         )
     assert payload["error"] == "invalid_session_data"
+
+
+# ---------------------------------------------------------------------------
+# F6 SECURITY: import_session path-traversal containment
+# ---------------------------------------------------------------------------
+
+
+async def test_import_session_rejects_path_traversal_id(tmp_path):
+    """A crafted traversal `id` is rejected with a clarification directive and
+    never used to compute an on-disk path outside the data root (F6)."""
+    srv = server.create_server(root=tmp_path)
+    async with create_connected_server_and_client_session(srv) as client:
+        payload = await _call(
+            client,
+            "import_session",
+            {
+                "data": {
+                    "id": "../../evil",
+                    "question": "pwn",
+                    "expected_stages": ["A"],
+                    "current_stage": "A",
+                }
+            },
+        )
+    assert payload["error"] == "retry_with_clarification"
+    assert payload["parameter"] == "id"
+    # nothing was written outside the data root's sessions dir
+    assert not (tmp_path.parent / "evil.json").exists()
+
+
+async def test_import_session_rejects_absolute_pathish_id(tmp_path):
+    """An absolute-path-ish id would, unguarded, reset the join to an absolute
+    write target; it must be rejected as a directive, writing nothing (F6)."""
+    srv = server.create_server(root=tmp_path)
+    escape_target = tmp_path.parent / "dt-escape.json"
+    async with create_connected_server_and_client_session(srv) as client:
+        payload = await _call(
+            client,
+            "import_session",
+            {
+                "data": {
+                    "id": str(tmp_path.parent / "dt-escape"),
+                    "question": "pwn",
+                    "expected_stages": ["A"],
+                    "current_stage": "A",
+                }
+            },
+        )
+    assert payload["error"] == "retry_with_clarification"
+    assert not escape_target.exists()
+
+
+async def test_import_session_clean_id_still_works(tmp_path):
+    """A clean uuid-hex id imports normally and resolves inside sessions/ (F6)."""
+    clean_id = "0123456789abcdef0123456789abcdef"
+    srv = server.create_server(root=tmp_path)
+    async with create_connected_server_and_client_session(srv) as client:
+        imported = await _call(
+            client,
+            "import_session",
+            {
+                "data": {
+                    "id": clean_id,
+                    "question": "clean import",
+                    "expected_stages": ["A"],
+                    "current_stage": "A",
+                }
+            },
+        )
+    assert "error" not in imported
+    assert imported["session_id"] == clean_id
+    saved = store.session_path(tmp_path, clean_id)
+    assert saved.exists()
+    assert saved.resolve().is_relative_to((tmp_path / "sessions").resolve())

@@ -70,6 +70,53 @@ def _deep_merge(base: dict[str, Any], overlay: dict[str, Any]) -> dict[str, Any]
     return merged
 
 
+# [F7 SECURITY] Per-session `overrides` can redirect the [subagent]/[autopilot]
+# endpoint to a caller-chosen URL. To keep the OPERATOR's api_key from being
+# POSTed to such a URL, `load_config` records the endpoints the operator
+# configured (packaged defaults + user config, BEFORE overrides) under this
+# reserved key; the adapter-construction seams consult it via
+# `api_key_allowed_for()`. The operator's key travels ONLY to operator-
+# configured endpoints -- an override-injected endpoint runs keyless.
+_OPERATOR_ENDPOINTS_KEY = "_operator_endpoints"
+
+
+def _subagent_endpoints(cfg: dict[str, Any]) -> list[str]:
+    """The [subagent] endpoint(s) as `endpoints_from_cfg` would resolve them
+    (list wins over single, blanks dropped). Kept here -- not imported from
+    subagent_engine -- so config.py stays dependency-free."""
+    sub = cfg.get("subagent", {})
+    multi = [str(e).strip() for e in (sub.get("endpoints") or []) if str(e).strip()]
+    if multi:
+        return multi
+    single = str(sub.get("endpoint", "") or "").strip()
+    return [single] if single else []
+
+
+def _autopilot_endpoint(cfg: dict[str, Any]) -> str:
+    return str(cfg.get("autopilot", {}).get("endpoint", "") or "").strip()
+
+
+def api_key_allowed_for(cfg: dict[str, Any], section: str, endpoint: str) -> bool:
+    """Whether the operator's api_key may travel to `endpoint` for `section`
+    ("subagent" | "autopilot").
+
+    `False` when `endpoint` appears only because of per-session overrides --
+    i.e. it is NOT among the endpoints the operator configured, recorded by
+    `load_config` (before overrides were merged). When no override marker is
+    present (no overrides were applied) every endpoint is operator-configured,
+    so `True`. See F7 / SECURITY.
+    """
+    marker = cfg.get(_OPERATOR_ENDPOINTS_KEY)
+    if not isinstance(marker, dict):
+        return True
+    endpoint = str(endpoint or "").strip()
+    if section == "subagent":
+        return endpoint in set(marker.get("subagent") or [])
+    if section == "autopilot":
+        return endpoint == str(marker.get("autopilot") or "")
+    return True
+
+
 def load_config(
     root: Path | str | None = None,
     overrides: dict[str, Any] | None = None,
@@ -90,7 +137,15 @@ def load_config(
         merged = _deep_merge(merged, user_config)
 
     if overrides:
+        # [F7 SECURITY] `merged` is the operator config (defaults + user config,
+        # NO overrides) -- record its endpoints so `api_key_allowed_for` can
+        # tell an override-injected endpoint from an operator-trusted one.
+        operator_marker = {
+            "subagent": _subagent_endpoints(merged),
+            "autopilot": _autopilot_endpoint(merged),
+        }
         merged = _deep_merge(merged, overrides)
+        merged[_OPERATOR_ENDPOINTS_KEY] = operator_marker
 
     return merged
 
