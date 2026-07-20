@@ -11,7 +11,8 @@
 # Data root. Overridden by the DEEP_THINK_HOME environment variable, which
 # always wins regardless of what's configured here. See config.resolve_root().
 root = "~/deep-think-mcp"
-# Both paths below are resolved relative to [store].root.
+# Reserved -- not yet honored (v1 always uses sessions/ and index.json). When
+# implemented, both will be resolved relative to [store].root.
 sessions_dir = "sessions"
 index_path = "index.json"
 

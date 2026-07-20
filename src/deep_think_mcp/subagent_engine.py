@@ -337,6 +337,9 @@ def _build_prompt(
         content=content,
         prompt_focus=prompt_focus,
         framings=framings,
+        # [F4] Weave the stage's critique-lens defaults in as specialist
+        # scaffolding (build-plan.md:251).
+        lenses=stages.lens_defaults_for_stage(session.current_stage),
     )
 
 

@@ -41,7 +41,10 @@ These bind every task. Copy verbatim into reviewer dispatches.
 - NECoRT vendored as a git submodule at `vendor/necort/` pinned to
   `f4d290ceb086d47bb0f872164344836c47134452` (head of
   PhialsBasement/Chain-of-Recursive-Thoughts PR #7).
-- The server never touches the network unless `autopilot.enabled=true`.
+- The server makes outbound network calls only for (a) subagent `engine="necort"`
+  runs against the configured `[subagent]` endpoint(s), and (b) autopilot when
+  `autopilot.enabled=true`; otherwise it never touches the network. (Both are
+  opt-in: the default `[subagent].endpoint` is empty and autopilot is disabled.)
 - Tolerant input handling (from M5 on): every tool accepts JSON or plaintext;
   malformed input returns a `retry_with_clarification` template, never a raw
   error.

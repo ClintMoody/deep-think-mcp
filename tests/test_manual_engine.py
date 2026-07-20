@@ -237,6 +237,16 @@ def _full(**dims):
     return base
 
 
+def test_lens_scaffolding_woven_into_manual_specialist_prompt():
+    """F4: the manual specialist prompt also carries the stage's critique
+    lenses (Analysis stage -> weak_evidence + overconfidence)."""
+    session = _session(stages=["Analysis", "Synthesis"])
+    cfg = _cfg(agents=["Analysis", "Creativity"])
+    mp = manual_engine.begin(session, "seed", None, cfg)
+    assert "weak_evidence" in mp.prompt_text
+    assert "overconfidence" in mp.prompt_text
+
+
 def test_manual_gate_uses_the_seven_dim_mean_not_correctness():
     """T13 fix round 1 adjudication: manual gates on the 7-dim MEAN, the same
     metric selection uses -- NOT correctness (that stays necort's gate)."""

@@ -208,6 +208,9 @@ def _hand_specialist(
         specialist_index=spec_index,
         specialist_total=len(roster),
         round_num=rr + 1,
+        # [F4] Weave the stage's critique-lens defaults in as specialist
+        # scaffolding (build-plan.md:251).
+        lenses=stages.lens_defaults_for_stage(session.current_stage),
     )
     return ManualPrompt(
         thought_id=thought.id,

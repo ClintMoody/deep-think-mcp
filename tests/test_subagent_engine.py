@@ -368,3 +368,22 @@ def test_subagent_matrix_commits_when_converged():
     )
     payload = prompts.subagent_matrix(_session(), state)
     assert payload["next_tool"] == "commit_subagent_thought"
+
+
+# ---------------------------------------------------------------------------
+# F4 stage critique lenses woven into the necort specialist prompt
+# ---------------------------------------------------------------------------
+
+
+async def test_lens_scaffolding_woven_into_necort_prompt(monkeypatch):
+    """F4: build-plan.md:251 mandates the stage's critique lenses frame the
+    subagent specialists' prompt. For the Analysis stage those defaults are
+    weak_evidence + overconfidence (stages.lens_defaults_for_stage)."""
+    recorder: list = []
+    _patch(monkeypatch, result=_fake_result(strength=0.9, content="c"), recorder=recorder)
+    session = _session(current_stage="Analysis")
+    cfg = _cfg(agents=["Analysis", "Creativity"])
+    await subagent_engine.begin(session, "seed", None, cfg)
+    prompt = recorder[0][1]
+    assert "weak_evidence" in prompt
+    assert "overconfidence" in prompt

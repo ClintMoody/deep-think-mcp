@@ -923,6 +923,27 @@ def specialist_framing(name: str) -> str:
     return SPECIALIST_FRAMINGS.get(name, _GENERIC_FRAMING)
 
 
+def lens_scaffolding(lenses: list[str]) -> str:
+    """[F4] A short critique-lens framing block for subagent specialist prompts.
+
+    build-plan.md § "Subagent mode uses lenses as additional prompt
+    scaffolding for specialists (e.g. the Analysis specialist gets
+    weak_evidence framing prepended)". Names each stage-default lens
+    (`stages.lens_defaults_for_stage`) as a focus to pressure-test the thought
+    against -- one directive line per lens, NOT the full serial-mode lens
+    template. Empty in -> empty out (custom stages with no lens defaults get no
+    scaffolding), so callers can append the result unconditionally.
+    """
+    if not lenses:
+        return ""
+    lines = [
+        "\nApply these stage critique lenses as you reason -- pressure-test the "
+        "thought against each:"
+    ]
+    lines.extend(f"- {lens}: guard against this failure mode." for lens in lenses)
+    return "\n".join(lines)
+
+
 def build_subagent_prompt(
     *,
     question: str,
@@ -931,6 +952,7 @@ def build_subagent_prompt(
     content: str | None,
     prompt_focus: str | None,
     framings: list[dict[str, Any]],
+    lenses: list[str] | None = None,
 ) -> str:
     """Assemble the single `user_input` string handed to the Nash core.
 
@@ -938,7 +960,8 @@ def build_subagent_prompt(
     engine computes each weight via `stages.agent_weight_for_stage`). The
     weighting is expressed in-prompt (a weak local model can't be handed a
     real utility multiplier, so we tell it in words which perspectives to
-    lean on harder in this stage).
+    lean on harder in this stage). `lenses` are the stage's critique-lens
+    defaults, woven in as scaffolding per build-plan.md:251 (F4).
     """
     parts: list[str] = [
         f"Question under deep-think reasoning:\n{question}",
@@ -958,6 +981,9 @@ def build_subagent_prompt(
         weight = float(framing["weight"])
         emphasis = f" [emphasis x{weight:g}]" if weight != 1.0 else ""
         parts.append(f"- {framing['name']}{emphasis}: {framing['framing']}")
+    scaffolding = lens_scaffolding(lenses or [])
+    if scaffolding:
+        parts.append(scaffolding)
     return "\n".join(parts)
 
 
@@ -997,6 +1023,7 @@ def build_manual_specialist_prompt(
     specialist_index: int,
     specialist_total: int,
     round_num: int,
+    lenses: list[str] | None = None,
 ) -> str:
     """The instruction text the model reads to voice one specialist.
 
@@ -1026,6 +1053,9 @@ def build_manual_specialist_prompt(
         parts.append(f"\nDevelop / improve this current best synthesis:\n{seed_content}")
     if prompt_focus:
         parts.append(f"\nFocus this thought specifically on: {prompt_focus}")
+    scaffolding = lens_scaffolding(lenses or [])
+    if scaffolding:
+        parts.append(scaffolding)
     dims = ", ".join(_UTILITY_DIMENSIONS)
     parts.append(
         "\nProduce this specialist's strongest candidate thought for this "

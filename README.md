@@ -288,8 +288,10 @@ model can fix its call and retry in one step.
 ## Autopilot (optional)
 
 Off by default and, when off, imports zero networking code (`httpx` stays a
-lazy, in-function import) — the server never touches the network unless
-autopilot is explicitly enabled. When `[autopilot].enabled = true`, two
+lazy, in-function import) — with autopilot off the server's only remaining
+outbound path is the subagent `engine="necort"` call to a configured
+`[subagent]` endpoint; with no endpoint configured and autopilot disabled it
+never touches the network. When `[autopilot].enabled = true`, two
 extra tools register: `run_stage_autopilot(session_id, stage=None,
 initial_content=None)` drives the whole serial critique loop for the
 current stage internally against the configured `[autopilot]` endpoint
@@ -330,8 +332,8 @@ default, generated from `config/default.toml`:
 | Section | Key | Default | Notes |
 |---|---|---|---|
 | `[store]` | `root` | `"~/deep-think-mcp"` | Overridden by `DEEP_THINK_HOME`, which always wins. |
-| `[store]` | `sessions_dir` | `"sessions"` | Resolved relative to `[store].root`. |
-| `[store]` | `index_path` | `"index.json"` | Resolved relative to `[store].root`. |
+| `[store]` | `sessions_dir` | `"sessions"` | Reserved — not yet honored (v1 always uses `sessions/`). |
+| `[store]` | `index_path` | `"index.json"` | Reserved — not yet honored (v1 always uses `index.json`). |
 | `[modes]` | `default_prompt_user` | `true` | The server always asks the user to pick a mode via `start_session`'s mode-required payload, even if this were `false`. |
 | `[serial]` | `max_rounds` | `3` | Hard cap on critique rounds per thought; forces commit with `converged_reason: "max_rounds"`. |
 | `[serial]` | `score_threshold` | `0.05` | A round's overall-score improvement below this (and the round before it, two in a row) triggers convergence. |
