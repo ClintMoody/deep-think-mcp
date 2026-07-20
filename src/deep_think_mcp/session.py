@@ -94,13 +94,22 @@ class Thought(BaseModel):
 
 
 class MoveRecord(BaseModel):
-    """One `Session.move_history` audit entry [derived structure]."""
+    """One `Session.move_history` audit entry [derived structure].
+
+    `unlink_failed` [derived, task 12]: `lifecycle.move()`'s final step
+    (removing the original file, now that the copy at `to_path` is written
+    and verified) is best-effort -- a failure there doesn't roll back an
+    already-successful move. This field is how that failure is surfaced to
+    a caller instead of being silently swallowed: True means the original
+    file at `from_path` could not be removed and was left behind.
+    """
 
     model_config = ConfigDict(extra="forbid")
 
     from_path: str
     to_path: str
     timestamp: datetime = Field(default_factory=_utcnow)
+    unlink_failed: bool = False
 
 
 class DecisionRecord(BaseModel):

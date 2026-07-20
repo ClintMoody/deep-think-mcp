@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import os
 import shutil
+from pathlib import Path
 
 import pytest
 
@@ -351,3 +352,148 @@ def test_move_rolls_back_mutation_when_verification_fails(tmp_path, monkeypatch)
     assert session.move_history == []
     assert session.save_path == old_path
     assert os.path.exists(old_path)
+
+
+# ---------------------------------------------------------------------------
+# move(): final-unlink failure -- the write to `target` is already done and
+# verified by this point, so the move is still a success. This must not be
+# a *silent* success, though: `MoveRecord.unlink_failed` is the signal a
+# caller (server.py) uses to warn instead of swallowing it. Task 12 ledger
+# item (T4 flagged this branch as untested).
+# ---------------------------------------------------------------------------
+
+
+def test_move_records_unlink_failed_when_original_removal_raises_oserror(
+    tmp_path, monkeypatch
+):
+    session = _make_saved_session(tmp_path)
+    old_path = Path(session.save_path).resolve()
+    dest = tmp_path / "elsewhere" / "moved.json"
+    dest.parent.mkdir()
+
+    real_unlink = Path.unlink
+
+    def _flaky_unlink(self, *args, **kwargs):
+        if self.resolve() == old_path:
+            raise OSError("simulated permissions race")
+        return real_unlink(self, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "unlink", _flaky_unlink)
+
+    result = lifecycle.move(session, str(dest))
+
+    # Still a success: the verified copy is what matters.
+    assert result is session
+    assert dest.is_file()
+    assert store.load(dest) == session
+    # But the original was left behind, and that fact is recorded rather
+    # than swallowed.
+    assert os.path.exists(old_path)
+    assert session.move_history[-1].unlink_failed is True
+
+
+def test_move_leaves_unlink_failed_false_on_the_ordinary_success_path(tmp_path):
+    session = _make_saved_session(tmp_path)
+    dest = tmp_path / "elsewhere" / "moved.json"
+    dest.parent.mkdir()
+
+    lifecycle.move(session, str(dest))
+
+    assert session.move_history[-1].unlink_failed is False
+
+
+# ---------------------------------------------------------------------------
+# move(): symlink aliasing -- a destination that is a symlink pointing at
+# the session's own current file must be caught by the same-path guard
+# (`destination_same_as_current`), not treated as a distinct, writable
+# target. `_resolve_destination`/`_validate_destination` both run paths
+# through `Path.resolve()`, which is documented to follow symlinks -- this
+# is the real-filesystem test proving that stdlib guarantee actually holds
+# for this module's usage (T4 left this documented-but-untested).
+# ---------------------------------------------------------------------------
+
+
+def test_move_rejects_a_symlink_that_resolves_to_the_current_file(tmp_path):
+    session = _make_saved_session(tmp_path)
+    current = Path(session.save_path)
+    alias_dir = tmp_path / "aliases"
+    alias_dir.mkdir()
+    alias = alias_dir / "alias.json"
+    alias.symlink_to(current)
+
+    with pytest.raises(lifecycle.MoveError) as exc_info:
+        lifecycle.move(session, str(alias))
+
+    assert exc_info.value.code == "destination_same_as_current"
+    assert session.move_history == []
+    assert os.path.exists(session.save_path)
+
+
+# ---------------------------------------------------------------------------
+# move(): status-independence -- moving a not-yet-finalized (still
+# "active") session must succeed exactly like a finalized one; the move
+# machinery has no opinion on `status` (docs/execution-plan.md Task 12).
+# Every other move() test in this file already happens to exercise this
+# (none of them call finalize first), but that fact was never pinned down
+# by an explicit assertion -- this test makes the intent load-bearing.
+# ---------------------------------------------------------------------------
+
+
+def test_move_of_a_not_yet_finalized_session_succeeds_and_status_is_unaffected(
+    tmp_path,
+):
+    session = _make_saved_session(tmp_path)
+    assert session.status == "active"
+    dest = tmp_path / "elsewhere" / "moved.json"
+    dest.parent.mkdir()
+
+    lifecycle.move(session, str(dest))
+
+    assert session.status == "active"
+    assert len(session.move_history) == 1
+
+
+# ---------------------------------------------------------------------------
+# keep_here(): a no-op on an already-moved session -- keep_here only ever
+# records a decision; it has no opinion on move_history either, and calling
+# it after a move must not raise or mutate save_path/move_history.
+# ---------------------------------------------------------------------------
+
+
+def test_keep_here_on_an_already_moved_session_is_a_valid_no_op(tmp_path):
+    session = _make_saved_session(tmp_path)
+    dest = tmp_path / "elsewhere" / "moved.json"
+    dest.parent.mkdir()
+    lifecycle.move(session, str(dest))
+    moved_path = session.save_path
+    move_history_len = len(session.move_history)
+
+    lifecycle.keep_here(session)
+
+    assert session.save_path == moved_path
+    assert len(session.move_history) == move_history_len
+    assert len(session.decisions) == 1
+    assert session.decisions[0].action == "keep_here"
+
+
+# ---------------------------------------------------------------------------
+# has_uncommitted_thought() -- the mode-agnostic signal `finalize_session`
+# uses to decide whether to warn about an in-progress thought (Task 12
+# ledger item, rooted in T8's finalize-doesn't-guard-in-progress-thought
+# note).
+# ---------------------------------------------------------------------------
+
+
+def test_has_uncommitted_thought_false_by_default():
+    session = Session(
+        question="q", expected_stages=["Research"], current_stage="Research"
+    )
+    assert lifecycle.has_uncommitted_thought(session) is False
+
+
+def test_has_uncommitted_thought_true_when_current_thought_id_is_set():
+    session = Session(
+        question="q", expected_stages=["Research"], current_stage="Research"
+    )
+    session.current_thought_id = "some-thought-id"
+    assert lifecycle.has_uncommitted_thought(session) is True

@@ -264,10 +264,11 @@ def _register_lifecycle_tools(mcp: FastMCP, data_root: Path) -> None:
         session, error = _load_session(data_root, session_id)
         if error is not None:
             return error
+        uncommitted = lifecycle.has_uncommitted_thought(session)
         session = lifecycle.finalize(session)
         store.save(session, session.save_path)
         index.upsert(data_root, session)
-        return prompts.session_finalized(session)
+        return prompts.session_finalized(session, uncommitted_thought=uncommitted)
 
     @mcp.tool()
     def move_session(session_id: str, new_path: str, force: bool = False) -> dict[str, Any]:

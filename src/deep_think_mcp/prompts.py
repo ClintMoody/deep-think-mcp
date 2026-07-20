@@ -220,8 +220,8 @@ def session_not_found(session_id: str) -> dict[str, Any]:
 # ---------------------------------------------------------------------------
 
 
-def session_finalized(session: Session) -> dict[str, Any]:
-    return {
+def session_finalized(session: Session, *, uncommitted_thought: bool = False) -> dict[str, Any]:
+    payload: dict[str, Any] = {
         "session_id": session.id,
         "status": session.status,
         "current_path": session.save_path,
@@ -241,6 +241,23 @@ def session_finalized(session: Session) -> dict[str, Any]:
             },
         ],
     }
+    # [task 12] finalize() never hard-blocks on an in-progress (uncommitted)
+    # thought -- see lifecycle.finalize()'s docstring for why -- but it also
+    # must not silently finalize over one. This warning is the middle
+    # ground: the finalize the caller asked for still happens, and they're
+    # told plainly that a thought is still open.
+    if uncommitted_thought:
+        payload["warning"] = "uncommitted_thought_exists"
+        payload["warning_message"] = (
+            f"Session '{session.id}' still has an in-progress thought (id "
+            f"`{session.current_thought_id}`) that was never committed. "
+            "Finalizing does not discard it, but it is not reflected in "
+            "the session's committed record. Call commit_thought (serial "
+            "mode) or commit_subagent_thought (subagent mode) first if you "
+            "want it included, or proceed with move_session/keep_here if "
+            "this is intentional."
+        )
+    return payload
 
 
 # ---------------------------------------------------------------------------
@@ -250,13 +267,27 @@ def session_finalized(session: Session) -> dict[str, Any]:
 
 def session_moved(session: Session) -> dict[str, Any]:
     last_move = session.move_history[-1]
-    return {
+    payload: dict[str, Any] = {
         "session_id": session.id,
         "status": session.status,
         "from_path": last_move.from_path,
         "new_path": session.save_path,
         "message": f"Session moved to `{session.save_path}`.",
     }
+    # [task 12] The move itself is a real, verified success either way --
+    # `lifecycle.move()`'s final unlink-of-the-original step is best-effort
+    # and never rolled back on failure. This warning is how that failure
+    # stops being silently swallowed: the caller is told the old file is
+    # still there instead of just trusting it's gone.
+    if last_move.unlink_failed:
+        payload["warning"] = "original_file_left_behind"
+        payload["old_path"] = last_move.from_path
+        payload["message"] = (
+            f"Session moved to `{session.save_path}`. The original file "
+            f"at `{last_move.from_path}` could not be removed and was "
+            "left behind."
+        )
+    return payload
 
 
 def move_failed(session_id: str, code: str, message: str) -> dict[str, Any]:

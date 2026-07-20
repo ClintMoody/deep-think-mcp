@@ -814,6 +814,123 @@ async def test_move_session_twice_accumulates_move_history_and_index_tracks_fina
 
 
 # ---------------------------------------------------------------------------
+# move_session: final-unlink failure -- fault injection at the MCP level.
+# The move itself must still be reported as a success (the verified copy is
+# what matters), but the payload must carry a warning + the old path
+# instead of silently swallowing the failure (Task 12 ledger item).
+# ---------------------------------------------------------------------------
+
+
+async def test_move_session_warns_when_original_unlink_fails(tmp_path, monkeypatch):
+    dest = tmp_path / "elsewhere" / "moved.json"
+    dest.parent.mkdir(parents=True)
+
+    srv = server.create_server(root=tmp_path)
+    async with create_connected_server_and_client_session(srv) as client:
+        started = await _call(client, "start_session", {"question": "q", "mode": "serial"})
+        session_id = started["session_id"]
+        original_path = store.session_path(tmp_path, session_id).resolve()
+
+        real_unlink = Path.unlink
+
+        def _flaky_unlink(self, *args, **kwargs):
+            if self.resolve() == original_path:
+                raise OSError("simulated permissions race")
+            return real_unlink(self, *args, **kwargs)
+
+        monkeypatch.setattr(Path, "unlink", _flaky_unlink)
+
+        payload = await _call(
+            client, "move_session", {"session_id": session_id, "new_path": str(dest)}
+        )
+        monkeypatch.undo()
+
+    # The move is still a success: it's truthful, and the verified copy is
+    # what matters.
+    assert "error" not in payload
+    assert payload["new_path"] == str(dest)
+    assert dest.is_file()
+    assert store.load(dest).id == session_id
+
+    # But the swallowed unlink failure surfaces as a warning, not silently.
+    assert payload["warning"] == "original_file_left_behind"
+    assert payload["old_path"] == str(original_path)
+    assert original_path.exists()  # left behind, as the warning says
+
+
+# ---------------------------------------------------------------------------
+# keep_here on an already-moved session: a valid no-op, recorded in the
+# audit trail. keep_here has no opinion on move_history -- it only ever
+# records a decision (Task 12 brief item).
+# ---------------------------------------------------------------------------
+
+
+async def test_keep_here_on_an_already_moved_session_is_a_valid_no_op(tmp_path):
+    dest = tmp_path / "elsewhere" / "moved.json"
+    dest.parent.mkdir(parents=True)
+
+    srv = server.create_server(root=tmp_path)
+    async with create_connected_server_and_client_session(srv) as client:
+        started = await _call(client, "start_session", {"question": "q", "mode": "serial"})
+        session_id = started["session_id"]
+
+        moved = await _call(
+            client, "move_session", {"session_id": session_id, "new_path": str(dest)}
+        )
+        payload = await _call(client, "keep_here", {"session_id": session_id})
+        resumed = await _call(client, "resume_session", {"session_id": session_id})
+
+    assert "error" not in payload
+    assert payload["save_path"] == str(dest)
+    assert payload["save_path"] == moved["new_path"]
+
+    session = store.load(dest)
+    assert len(session.decisions) == 1
+    assert session.decisions[0].action == "keep_here"
+    assert len(session.move_history) == 1  # untouched by keep_here
+
+    assert resumed["save_path"] == str(dest)
+
+
+# ---------------------------------------------------------------------------
+# finalize_session: in-progress (uncommitted) thought. finalize is user-
+# driven and still finalizes -- it does not hard-block -- but the payload
+# warns rather than silently finalizing over an uncommitted thought (Task
+# 12 ledger item, rooted in T8's finalize-doesn't-guard note).
+# ---------------------------------------------------------------------------
+
+
+async def test_finalize_session_warns_about_an_uncommitted_thought(tmp_path):
+    srv = server.create_server(root=tmp_path)
+    async with create_connected_server_and_client_session(srv) as client:
+        started = await _call(client, "start_session", {"question": "q", "mode": "serial"})
+        session_id = started["session_id"]
+        await _call(client, "begin_thought", {"session_id": session_id, "content": "draft"})
+
+        payload = await _call(client, "finalize_session", {"session_id": session_id})
+
+    # Still finalizes -- finalize is user-driven and never hard-blocks.
+    assert payload["status"] == "finalized"
+    session = store.load(store.session_path(tmp_path, session_id))
+    assert session.status == "finalized"
+
+    assert payload["warning"] == "uncommitted_thought_exists"
+    assert "warning_message" in payload
+    assert session.current_thought_id in payload["warning_message"]
+
+
+async def test_finalize_session_without_an_in_progress_thought_has_no_warning(tmp_path):
+    srv = server.create_server(root=tmp_path)
+    async with create_connected_server_and_client_session(srv) as client:
+        started = await _call(client, "start_session", {"question": "q", "mode": "serial"})
+        session_id = started["session_id"]
+
+        payload = await _call(client, "finalize_session", {"session_id": session_id})
+
+    assert "warning" not in payload
+
+
+# ---------------------------------------------------------------------------
 # advance_stage (Task 5) -- Layer 3, the stage machine. Gated by mode_gate:
 # a session with no mode set has no engine to hand its committed thoughts
 # to, so stage progression has nothing meaningful to do yet either (see

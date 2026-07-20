@@ -56,7 +56,20 @@ the server that deletes/moves files based on tool input:
     it's the same file), and then unlink `current` -- deleting the
     session it just "moved". Rejecting the case up front means that
     write/unlink code never has to reason about source and destination
-    aliasing the same inode.
+    aliasing the same inode. Because both sides are run through
+    `Path.resolve()` before this comparison, a destination that is a
+    *symlink* pointing at the current file is caught by this same guard
+    -- it resolves to the identical real path, not a distinct target
+    [task 12: previously documented but untested; see
+    `tests/test_lifecycle.py::test_move_rejects_a_symlink_that_resolves_to_the_current_file`].
+  - The final step -- removing the now-superseded original file, after
+    the copy at `target` is already written and verified -- is
+    best-effort: a failure there (e.g. a permissions race) does not roll
+    back an already-successful move, since the verified data is safe at
+    its new location. It is not, however, a *silent* success:
+    `MoveRecord.unlink_failed` records the failure so a caller can warn
+    instead of swallowing it [task 12: previously untested; T4 flagged
+    this as the module's one deliberately-unsignalled edge case].
 """
 
 from __future__ import annotations
@@ -90,10 +103,37 @@ def finalize(session: Session) -> Session:
     needs to tell a move/keep decision made in answer to this finalize's
     own move/keep prompt apart from an earlier one made while the session
     was still active (Task 8 fix round 1).
+
+    Deliberately does not guard an in-progress (uncommitted) thought
+    (`session.current_thought_id is not None`) -- finalize is user-driven,
+    and a hard block here would force a caller stuck mid-thought to detour
+    through an engine tool just to end the session, which is exactly the
+    kind of extra round-trip the "built for weak local models" directive-
+    payload design (Global Constraints) exists to avoid. `finalize()`
+    itself stays a pure, unconditional mutation, matching every other
+    lifecycle tool; `has_uncommitted_thought()` below is the signal
+    `server.py` uses to add a *warning* to the success payload instead
+    [task 12, closing the ledger note T8 raised].
     """
     session.status = "finalized"
     session.finalized_at = datetime.now(timezone.utc)
     return session
+
+
+def has_uncommitted_thought(session: Session) -> bool:
+    """True if `session` has an in-progress (uncommitted) thought -- a
+    `begin_thought`/`begin_subagent_thought` call with no matching
+    `commit_thought`/`commit_subagent_thought` yet.
+
+    `current_thought_id` is set by both engines' `begin_*` and cleared by
+    both engines' commit functions (`serial_engine.commit_thought`,
+    `subagent_engine.commit`), so its mere presence is a mode-agnostic,
+    O(1) signal -- no need to search `session.thoughts`. Used by
+    `server.py`'s `finalize_session` to decide whether to attach a warning
+    to the finalize payload (see `finalize()`'s docstring for why
+    finalize itself doesn't block on this).
+    """
+    return session.current_thought_id is not None
 
 
 def keep_here(session: Session) -> Session:
@@ -213,7 +253,20 @@ def move(session: Session, new_path: str, *, force: bool = False) -> Session:
         # remove the now-superseded original (e.g. a permissions race)
         # leaves a harmless stray duplicate rather than losing data or
         # forcing the caller to retry a move that actually already
-        # succeeded.
-        pass
+        # succeeded. Not silently swallowed, though: record it on the
+        # move_history entry just appended, so the caller can warn instead
+        # of reporting an unqualified success [task 12].
+        session.move_history[-1].unlink_failed = True
+        try:
+            # The copy already written+verified at `target` predates this
+            # flag flip, so without this it would only ever live in the
+            # in-memory `session` this call returns, not on disk. Also
+            # best-effort: a failure here must not turn an already-
+            # successful, already-verified move into a raised error -- the
+            # in-memory session (and thus this call's return value) still
+            # carries the flag either way.
+            store.save(session, target)
+        except OSError:
+            pass
 
     return session
