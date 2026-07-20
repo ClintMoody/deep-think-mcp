@@ -71,7 +71,7 @@ async def test_next_action_no_mode_directs_to_set_session_mode(tmp_path):
     assert payload["next_tool"] == "set_session_mode"
 
 
-async def test_next_action_subagent_mode_not_available(tmp_path):
+async def test_next_action_subagent_mode_active_directs_to_begin(tmp_path):
     srv = server.create_server(root=tmp_path)
     async with create_connected_server_and_client_session(srv) as client:
         started = await _call(
@@ -80,8 +80,9 @@ async def test_next_action_subagent_mode_not_available(tmp_path):
         payload = await _call(
             client, "next_action", {"session_id": started["session_id"]}
         )
-    assert payload["code"] == "subagent_not_available"
-    assert payload["next_tool"] is None
+    assert payload["code"] == "subagent_no_thought_begin"
+    assert payload["next_tool"] == "begin_subagent_thought"
+    assert payload["alternative_tool"] == "advance_stage"
 
 
 async def test_next_action_unknown_session_returns_not_found(tmp_path):

@@ -42,7 +42,7 @@ from typing import Any
 
 from pydantic import ValidationError
 
-from deep_think_mcp import serial_engine, stages
+from deep_think_mcp import serial_engine, stages, subagent_engine
 from deep_think_mcp.session import Session, Thought
 
 # ---------------------------------------------------------------------------
@@ -104,14 +104,21 @@ def next_action(session: Session, cfg: dict[str, Any]) -> NextAction:
     Truth table (`docs/execution-plan.md` Task 8, minimum required rows):
 
       - `mode is None`                          -> set_session_mode
-      - `mode == "subagent"`                    -> "not yet available"
-        (Tasks 9-11 haven't built the subagent engine yet, so there is no
-        real tool to point at. This is a deliberately coarse judgment
-        call: EVERY subagent-mode session gets this answer regardless of
-        `status`, not just ones mid-loop -- there's no loop to be mid of.
-        T11 will replace this branch with the real subagent truth table
-        once `begin_subagent_thought`/etc. exist; until then this is the
-        only truthful thing next_action can say.)
+      - `status == "finalized"` / `"archived"`  -> the move/keep or
+        "nothing left" rows below. These are handled BEFORE the per-mode
+        active-session dispatch because the lifecycle is mode-independent
+        (both engines share finalize/move/keep) -- so a finalized subagent
+        session gets the same move/keep prompt a serial one does.
+      - subagent mode, `status == "active"` (T11 truth table, mirroring
+        serial's shape via `subagent_engine.loop_state`):
+          - no thought in progress: final stage -> `finalize_session`,
+            else -> `begin_subagent_thought` (alt: `advance_stage`)
+          - equilibrium strong (winner's populated Nash dim >=
+            `equilibrium_threshold`) -> `commit_subagent_thought`
+          - round budget (`subagent.max_rounds`) spent ->
+            `commit_subagent_thought`
+          - otherwise (below threshold, budget remains) ->
+            `advance_subagent_round` (alt: `commit_subagent_thought`)
       - serial mode, `status == "active"`, a thought is in progress
         (`serial_engine.loop_phase` != "no_thought") -> the exact
         sub-step the loop is waiting on (critique / submit / refine /
@@ -152,10 +159,9 @@ def next_action(session: Session, cfg: dict[str, Any]) -> NextAction:
     if session.mode is None:
         return NextAction("mode_required", "set_session_mode")
 
-    if session.mode == "subagent":
-        return NextAction("subagent_not_available", None)
-
-    # session.mode == "serial" from here on.
+    # Finalized / archived are mode-independent (both engines share the
+    # finalize/move/keep lifecycle), so resolve them before the per-mode
+    # active-session dispatch below.
     if session.status == "finalized":
         if _has_post_finalize_decision(session):
             return NextAction("session_complete", None)
@@ -168,6 +174,10 @@ def next_action(session: Session, cfg: dict[str, Any]) -> NextAction:
         # sets it today, but a hand-edited/imported session could carry it.
         return NextAction("session_archived", None)
 
+    if session.mode == "subagent":
+        return _subagent_next_action(session, cfg)
+
+    # session.mode == "serial", status == "active" from here on.
     phase = serial_engine.loop_phase(session)
 
     if phase == "no_thought":
@@ -194,6 +204,34 @@ def next_action(session: Session, cfg: dict[str, Any]) -> NextAction:
     if converged:
         return NextAction("loop_converged", "commit_thought", {"converged_reason": reason})
     return NextAction("loop_continue", "critique_current_thought")
+
+
+def _subagent_next_action(session: Session, cfg: dict[str, Any]) -> NextAction:
+    """The subagent-mode active-session rows (T11), mirroring the serial loop's
+    shape. Reads the engine's `loop_state` rather than re-deriving equilibrium
+    state -- the one seam, exactly as the serial branch calls through
+    `serial_engine.loop_phase` / `evaluate_convergence`.
+    """
+    state = subagent_engine.loop_state(session, cfg)
+
+    if state == "no_thought":
+        if stages.is_final_stage(session):
+            return NextAction("subagent_no_thought_final_stage", "finalize_session")
+        return NextAction(
+            "subagent_no_thought_begin",
+            "begin_subagent_thought",
+            {"alternative_tool": "advance_stage"},
+        )
+    if state == "converged":
+        return NextAction("subagent_converged", "commit_subagent_thought")
+    if state == "budget_exhausted":
+        return NextAction("subagent_budget_exhausted", "commit_subagent_thought")
+    # state == "can_advance"
+    return NextAction(
+        "subagent_can_advance",
+        "advance_subagent_round",
+        {"alternative_tool": "commit_subagent_thought"},
+    )
 
 
 # ---------------------------------------------------------------------------

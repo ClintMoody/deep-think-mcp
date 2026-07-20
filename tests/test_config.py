@@ -101,7 +101,7 @@ def test_resolve_root_falls_back_to_hardcoded_default_when_store_root_missing(
 def test_load_config_with_no_user_file_returns_packaged_defaults(tmp_path):
     cfg = config.load_config(root=tmp_path)
     assert cfg["serial"]["max_rounds"] == 3
-    assert cfg["subagent"]["agents"] == ["Analysis", "Creativity"]
+    assert cfg["subagent"]["agents"] == ["Analysis", "Creativity", "Skeptic"]
 
 
 def test_load_config_user_config_overrides_defaults(tmp_path):

@@ -80,22 +80,87 @@ def test_next_action_no_mode_directs_to_set_session_mode():
     assert result.next_tool == "set_session_mode"
 
 
-def test_next_action_subagent_mode_reports_engine_not_available():
+def _subagent_cfg(max_rounds=2, threshold=0.75):
+    return {"subagent": {"max_rounds": max_rounds, "equilibrium_threshold": threshold}}
+
+
+def _uscore(v):
+    return UtilityScore(
+        correctness=v, clarity=v, coverage=v,
+        evidence=0.5, novelty=0.5, bias_resistance=0.5, actionability=0.5,
+    )
+
+
+def _session_with_subagent_thought(strength, us_rounds, stages=None, current_stage=None):
+    """A subagent session with an in-flight thought carrying `us_rounds`
+    winner-marked specialist rounds at the given strength."""
+    from deep_think_mcp.session import SpecialistRound
+
+    session = _session(mode="subagent", stages=stages, current_stage=current_stage)
+    thought = Thought(stage=session.current_stage, position=0, content="c")
+    for i in range(us_rounds):
+        thought.specialist_rounds.append(
+            SpecialistRound(
+                round_index=i,
+                agent_role="Analysis",
+                candidate_content=f"cand-{i}",
+                utility_vector=_uscore(strength),
+                equilibrium_state="in_equilibrium",
+                was_selected=True,
+            )
+        )
+    thought.final_utility_scores = _uscore(strength)
+    session.thoughts.append(thought)
+    session.current_thought_id = thought.id
+    return session
+
+
+def test_next_action_subagent_active_no_thought_directs_to_begin():
     session = _session(mode="subagent")
-    result = meta.next_action(session, _cfg())
-    assert result.code == "subagent_not_available"
-    assert result.next_tool is None
+    result = meta.next_action(session, _subagent_cfg())
+    assert result.code == "subagent_no_thought_begin"
+    assert result.next_tool == "begin_subagent_thought"
+    assert result.detail["alternative_tool"] == "advance_stage"
 
 
-def test_next_action_subagent_mode_not_available_even_when_finalized():
-    """Coarse-but-truthful judgment call (per the brief): today, ANY
-    subagent-mode session reports 'not available', regardless of status --
-    there's no engine yet to have produced any other state. T11 revisits
-    this once the subagent engine exists.
-    """
+def test_next_action_subagent_final_stage_no_thought_directs_to_finalize():
+    session = _session(mode="subagent", current_stage="Analysis")  # last stage
+    result = meta.next_action(session, _subagent_cfg())
+    assert result.code == "subagent_no_thought_final_stage"
+    assert result.next_tool == "finalize_session"
+
+
+def test_next_action_subagent_finalized_directs_to_move_like_serial():
+    """A finalized subagent session gets the SAME move/keep prompt a serial
+    one does -- the lifecycle is mode-independent (the old placeholder wrongly
+    swallowed this into 'not available')."""
     session = _session(mode="subagent", status="finalized")
-    result = meta.next_action(session, _cfg())
-    assert result.code == "subagent_not_available"
+    result = meta.next_action(session, _subagent_cfg())
+    assert result.code == "await_move_decision"
+    assert result.next_tool == "move_session"
+
+
+def test_next_action_subagent_converged_directs_to_commit():
+    session = _session_with_subagent_thought(strength=0.9, us_rounds=1)
+    result = meta.next_action(session, _subagent_cfg(max_rounds=2, threshold=0.75))
+    assert result.code == "subagent_converged"
+    assert result.next_tool == "commit_subagent_thought"
+
+
+def test_next_action_subagent_below_threshold_directs_to_advance():
+    session = _session_with_subagent_thought(strength=0.5, us_rounds=1)
+    result = meta.next_action(session, _subagent_cfg(max_rounds=2, threshold=0.75))
+    assert result.code == "subagent_can_advance"
+    assert result.next_tool == "advance_subagent_round"
+    assert result.detail["alternative_tool"] == "commit_subagent_thought"
+
+
+def test_next_action_subagent_budget_exhausted_directs_to_commit():
+    # Below threshold but the round budget is spent -> commit, not advance.
+    session = _session_with_subagent_thought(strength=0.5, us_rounds=2)
+    result = meta.next_action(session, _subagent_cfg(max_rounds=2, threshold=0.75))
+    assert result.code == "subagent_budget_exhausted"
+    assert result.next_tool == "commit_subagent_thought"
 
 
 def test_next_action_serial_no_thought_not_final_stage_directs_begin_thought():

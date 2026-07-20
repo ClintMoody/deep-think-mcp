@@ -393,7 +393,7 @@ async def test_mode_gate_returns_not_found_for_unknown_session(tmp_path):
 
 # ---------------------------------------------------------------------------
 # create_server() tool surface: the 9 lifecycle tools, Task 5's advance_stage,
-# and Task 7's six serial-engine thought tools -- no more
+# Task 7's six serial-engine tools, and Task 11's four subagent-engine tools
 # ---------------------------------------------------------------------------
 
 
@@ -420,6 +420,10 @@ async def test_create_server_registers_exactly_the_lifecycle_and_stage_tools(tmp
         "refine_current_thought",
         "score_current_thought",
         "commit_thought",
+        "begin_subagent_thought",
+        "advance_subagent_round",
+        "inspect_utility_matrix",
+        "commit_subagent_thought",
         "next_action",
         "summarize_session",
         "compress_history",

@@ -29,6 +29,7 @@ tool, not a thought-loop tool, is gated the same way.
 
 from __future__ import annotations
 
+import asyncio
 import functools
 import uuid
 from pathlib import Path
@@ -46,6 +47,7 @@ from deep_think_mcp import (
     serial_engine,
     stages,
     store,
+    subagent_engine,
 )
 from deep_think_mcp.session import Session
 
@@ -106,12 +108,24 @@ def mode_gate(
     (verified against the SDK: FastMCP's schema introspection follows
     `__wrapped__`), so `@mcp.tool()` above this decorator still sees the
     original parameter names/types, not a generic `*args, **kwargs`.
+
+    Async support (T11): the subagent engine's `run()` is `async` (it offloads
+    the vendored blocking Nash I/O onto a worker thread), so its two tools are
+    `async def`. `mode_gate` was originally sync-only; it is extended here
+    MINIMALLY -- when the wrapped function is a coroutine function it returns an
+    `async` wrapper that `await`s it, otherwise the original sync wrapper is
+    unchanged. The gate check itself (`_load_session` + mode checks) is a fast
+    local read either way and stays synchronous inside the async wrapper. This
+    is the `docs/execution-plan.md` Task 7 `[derived]` note's anticipated
+    extension; sync engine tools (serial, `advance_stage`) are entirely
+    unaffected.
     """
     root = Path(data_root).expanduser().resolve()
 
-    def decorator(fn: Callable[..., dict[str, Any]]) -> Callable[..., dict[str, Any]]:
-        @functools.wraps(fn)
-        def wrapper(session_id: str, *args: Any, **kwargs: Any) -> dict[str, Any]:
+    def decorator(fn: Callable[..., Any]) -> Callable[..., Any]:
+        def _gate(session_id: str) -> dict[str, Any] | None:
+            """Run the mode-gate checks; return a directive payload to
+            short-circuit with, or None to let the wrapped function proceed."""
             session, error = _load_session(root, session_id)
             if error is not None:
                 return error
@@ -124,6 +138,24 @@ def mode_gate(
                     current_mode=session.mode,
                     blocked_tool=fn.__name__,
                 )
+            return None
+
+        if asyncio.iscoroutinefunction(fn):
+
+            @functools.wraps(fn)
+            async def async_wrapper(session_id: str, *args: Any, **kwargs: Any) -> dict[str, Any]:
+                blocked = _gate(session_id)
+                if blocked is not None:
+                    return blocked
+                return await fn(session_id, *args, **kwargs)
+
+            return async_wrapper
+
+        @functools.wraps(fn)
+        def wrapper(session_id: str, *args: Any, **kwargs: Any) -> dict[str, Any]:
+            blocked = _gate(session_id)
+            if blocked is not None:
+                return blocked
             return fn(session_id, *args, **kwargs)
 
         return wrapper
@@ -457,6 +489,109 @@ def _register_serial_tools(mcp: FastMCP, data_root: Path) -> None:
         return prompts.thought_committed(session, thought)
 
 
+def _register_subagent_tools(mcp: FastMCP, data_root: Path) -> None:
+    """Register Task 11's four subagent-engine tools (Layer 4, subagent mode).
+
+    Each is gated by `mode_gate(data_root, require_mode="subagent")`: a
+    no-mode session gets `mode_required`, a serial-mode session gets
+    `wrong_mode`, and neither reaches the engine. `begin_subagent_thought` and
+    `advance_subagent_round` are `async def` (they drive the T10 adapter's
+    async `run()`, which offloads the vendored blocking Nash I/O to a worker
+    thread) -- `mode_gate`'s async extension wraps them. `inspect_utility_matrix`
+    and `commit_subagent_thought` do no network I/O and stay synchronous.
+
+    These wrappers only load the session, call the engine, map any
+    `SubagentSequencingError`/`SubagentAdapterError` to a directive payload
+    (never a raw traceback -- T11 hard contract #3), and, on success, persist
+    and format via `prompts.py` -- the same load/mutate/persist division the
+    serial tools follow.
+    """
+
+    def _persist(session: Session) -> None:
+        store.save(session, session.save_path)
+        index.upsert(data_root, session)
+
+    def _cfg(session: Session) -> dict[str, Any]:
+        return config.load_config(root=data_root, overrides=session.overrides)
+
+    @mcp.tool()
+    @mode_gate(data_root, require_mode="subagent")
+    async def begin_subagent_thought(
+        session_id: str,
+        content: str | None = None,
+        prompt_focus: str | None = None,
+    ) -> dict[str, Any]:
+        """Start a subagent thought: run the first Nash equilibrium round via
+        the NECoRT core over the configured specialist framings. Fails with a
+        directive if a thought is already in progress, or -- when no endpoint
+        is configured -- points at the endpoint-free manual specialist path.
+        """
+        session, error = _load_session(data_root, session_id)
+        if error is not None:
+            return error
+        try:
+            result = await subagent_engine.begin(session, content, prompt_focus, _cfg(session))
+        except subagent_engine.SubagentSequencingError as exc:
+            return prompts.subagent_directive(session_id, exc.code, **exc.detail)
+        except subagent_engine.SubagentAdapterError as exc:
+            return prompts.subagent_adapter_error(session_id, exc.detail, exc.retryable)
+        _persist(session)
+        return prompts.subagent_thought_begun(session, result)
+
+    @mcp.tool()
+    @mode_gate(data_root, require_mode="subagent")
+    async def advance_subagent_round(session_id: str) -> dict[str, Any]:
+        """Run the next Nash round, re-seeding the current best candidate. The
+        round budget (`subagent.max_rounds`) is enforced here: once spent, this
+        returns a directive pointing at `commit_subagent_thought` rather than
+        running another round.
+        """
+        session, error = _load_session(data_root, session_id)
+        if error is not None:
+            return error
+        try:
+            result = await subagent_engine.advance(session, _cfg(session))
+        except subagent_engine.SubagentSequencingError as exc:
+            return prompts.subagent_directive(session_id, exc.code, **exc.detail)
+        except subagent_engine.SubagentAdapterError as exc:
+            return prompts.subagent_adapter_error(session_id, exc.detail, exc.retryable)
+        _persist(session)
+        return prompts.subagent_round_advanced(session, result)
+
+    @mcp.tool()
+    @mode_gate(data_root, require_mode="subagent")
+    def inspect_utility_matrix(session_id: str) -> dict[str, Any]:
+        """Return the current Nash scoring state: the latest round's
+        per-candidate utility vectors, equilibrium states, and selected winner.
+        Read-only (no engine mutation, no network).
+        """
+        session, error = _load_session(data_root, session_id)
+        if error is not None:
+            return error
+        try:
+            state = subagent_engine.inspect(session, _cfg(session))
+        except subagent_engine.SubagentSequencingError as exc:
+            return prompts.subagent_directive(session_id, exc.code, **exc.detail)
+        return prompts.subagent_matrix(session, state)
+
+    @mcp.tool()
+    @mode_gate(data_root, require_mode="subagent")
+    def commit_subagent_thought(session_id: str) -> dict[str, Any]:
+        """Accept the current equilibrium: lock the winning candidate as the
+        thought's content and clear the current-thought cursor. Fails with a
+        directive if no Nash round has run yet.
+        """
+        session, error = _load_session(data_root, session_id)
+        if error is not None:
+            return error
+        try:
+            thought = subagent_engine.commit(session)
+        except subagent_engine.SubagentSequencingError as exc:
+            return prompts.subagent_directive(session_id, exc.code, **exc.detail)
+        _persist(session)
+        return prompts.subagent_thought_committed(session, thought)
+
+
 def _register_meta_tools(mcp: FastMCP, data_root: Path) -> None:
     """Register Task 8's meta tools (Layer 5): `next_action` (the
     authoritative next-step resolver across every session state x mode),
@@ -571,6 +706,7 @@ def create_server(root: Path | str | None = None) -> FastMCP:
     _register_lifecycle_tools(mcp, data_root)
     _register_stage_tools(mcp, data_root)
     _register_serial_tools(mcp, data_root)
+    _register_subagent_tools(mcp, data_root)
     _register_meta_tools(mcp, data_root)
     return mcp
 

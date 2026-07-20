@@ -23,6 +23,7 @@ from deep_think_mcp.session import Session, Thought
 if TYPE_CHECKING:
     from deep_think_mcp.meta import CompressResult, NextAction, SummaryResult
     from deep_think_mcp.serial_engine import CritiquePrompt, ScoreResult
+    from deep_think_mcp.subagent_engine import MatrixState, SubagentRoundResult
 
 # ---------------------------------------------------------------------------
 # Mode descriptions -- single source of truth for list_modes() and every
@@ -580,10 +581,19 @@ _NEXT_ACTION_MESSAGES: dict[str, str] = {
         "No mode is set yet. Read the mode descriptions to the user, then "
         "call set_session_mode(session_id, mode)."
     ),
-    "subagent_not_available": (
-        "This session is in subagent mode. Its engine tools aren't "
-        "implemented yet (arriving in later tasks) -- there is no "
-        "thought-loop action available on this session right now."
+    "subagent_converged": (
+        "The Nash equilibrium is strong (the winning candidate's rating is at "
+        "or above the commit threshold). Call "
+        "commit_subagent_thought(session_id) to lock it in."
+    ),
+    "subagent_budget_exhausted": (
+        "The subagent round budget (max_rounds) is spent. Accept the current "
+        "equilibrium: call commit_subagent_thought(session_id)."
+    ),
+    "subagent_can_advance": (
+        "The equilibrium hasn't reached the commit threshold yet and rounds "
+        "remain. Refine it with advance_subagent_round(session_id), or accept "
+        "it now with commit_subagent_thought(session_id)."
     ),
     "loop_zero_rounds": (
         "A thought is drafted but hasn't been critiqued yet. Call "
@@ -641,6 +651,20 @@ def next_action_result(session: Session, result: NextAction) -> dict[str, Any]:
         message = (
             f"Converged ({result.detail.get('converged_reason')}). Call "
             "commit_thought(session_id) to lock it in."
+        )
+    elif result.code == "subagent_no_thought_final_stage":
+        message = (
+            f"'{session.current_stage}' is the final stage and no subagent "
+            "thought is in progress. Call finalize_session(session_id) when "
+            "this session's reasoning is complete (or "
+            "begin_subagent_thought(session_id) for one more thought in this "
+            "stage first)."
+        )
+    elif result.code == "subagent_no_thought_begin":
+        message = (
+            "No subagent thought is in progress. Start one with "
+            "begin_subagent_thought(session_id, content), or "
+            f"advance_stage(session_id) if '{session.current_stage}' is done."
         )
     else:
         message = _NEXT_ACTION_MESSAGES.get(
@@ -757,5 +781,283 @@ def session_imported(session: Session, id_reassigned: bool) -> dict[str, Any]:
         "session_id": session.id,
         "save_path": session.save_path,
         "id_reassigned": id_reassigned,
+        "message": message,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Task 11: subagent (NECoRT) mode. Wording for the four tools' success
+# payloads, the Nash-invocation prompt template, and the sequencing/adapter
+# directives -- same "wording lives here, engine lives in subagent_engine.py"
+# division Task 7 established.
+# ---------------------------------------------------------------------------
+
+# Default specialist framings, keyed by the config `[subagent].agents` roster.
+# Each is the perspective that specialist argues from when generating a
+# candidate thought; stage weighting (stages.agent_weight_for_stage) is layered
+# on top by the engine. A roster name with no entry here gets `_GENERIC_FRAMING`.
+SPECIALIST_FRAMINGS: dict[str, str] = {
+    "Analysis": (
+        "Reason rigorously and analytically. Decompose the problem into parts, "
+        "trace cause and effect, demand evidence for each claim, and prize "
+        "correctness and completeness over flourish."
+    ),
+    "Creativity": (
+        "Reason divergently and imaginatively. Reframe the problem, surface "
+        "non-obvious angles and analogies, and propose novel approaches others "
+        "would overlook -- prize originality and fresh perspective."
+    ),
+    "Skeptic": (
+        "Reason adversarially. Hunt for the hidden assumption, the weak link, "
+        "the missing counter-case, and the bias in the framing; state what "
+        "would have to be true for the answer to be wrong -- prize "
+        "bias-resistance and robustness."
+    ),
+}
+
+_GENERIC_FRAMING = (
+    "Reason carefully from your own distinct perspective, contributing an "
+    "angle the other specialists would not."
+)
+
+
+def specialist_framing(name: str) -> str:
+    """The default framing text for a configured specialist name."""
+    return SPECIALIST_FRAMINGS.get(name, _GENERIC_FRAMING)
+
+
+def build_subagent_prompt(
+    *,
+    question: str,
+    stage: str,
+    prior_context: str,
+    content: str | None,
+    prompt_focus: str | None,
+    framings: list[dict[str, Any]],
+) -> str:
+    """Assemble the single `user_input` string handed to the Nash core.
+
+    `framings` is a list of `{"name", "framing", "weight"}` dicts (the
+    engine computes each weight via `stages.agent_weight_for_stage`). The
+    weighting is expressed in-prompt (a weak local model can't be handed a
+    real utility multiplier, so we tell it in words which perspectives to
+    lean on harder in this stage).
+    """
+    parts: list[str] = [
+        f"Question under deep-think reasoning:\n{question}",
+        f"\nCurrent reasoning stage: {stage}.",
+    ]
+    if prior_context:
+        parts.append(f"\nEstablished context from earlier stages:\n{prior_context}")
+    if content:
+        parts.append(f"\nStarting point to develop:\n{content}")
+    if prompt_focus:
+        parts.append(f"\nFocus this thought specifically on: {prompt_focus}")
+    parts.append(
+        "\nGenerate the strongest possible thought for this stage, drawing on "
+        "these specialist perspectives (lean harder on the emphasized ones):"
+    )
+    for framing in framings:
+        weight = float(framing["weight"])
+        emphasis = f" [emphasis x{weight:g}]" if weight != 1.0 else ""
+        parts.append(f"- {framing['name']}{emphasis}: {framing['framing']}")
+    return "\n".join(parts)
+
+
+def _subagent_round_common(result: SubagentRoundResult) -> dict[str, Any]:
+    """The fields common to both begin/advance success payloads."""
+    return {
+        "thought_id": result.thought_id,
+        "us_round": result.us_round,
+        "rounds_run": result.rounds_run,
+        "max_rounds": result.max_rounds,
+        "equilibrium_strength": round(result.strength, 3),
+        "commit_threshold": result.threshold,
+        "converged": result.converged,
+        "budget_exhausted": result.budget_exhausted,
+        "endpoints_used": result.endpoints_used,
+        "selected_content": result.selected_content,
+        "final_utility_scores": result.final_utility_scores,
+    }
+
+
+def _subagent_next_step(result: SubagentRoundResult) -> tuple[str, str]:
+    """(next_tool, message) after a subagent round, from the equilibrium state."""
+    if result.converged:
+        return (
+            "commit_subagent_thought",
+            "The equilibrium is strong (winning candidate's rating "
+            f"{result.strength:.2f} >= threshold {result.threshold:.2f}). Accept "
+            "it with commit_subagent_thought(session_id), or inspect it first "
+            "with inspect_utility_matrix(session_id).",
+        )
+    if result.budget_exhausted:
+        return (
+            "commit_subagent_thought",
+            f"The round budget (max_rounds={result.max_rounds}) is spent and the "
+            f"equilibrium's rating is {result.strength:.2f}. Accept it with "
+            "commit_subagent_thought(session_id).",
+        )
+    return (
+        "advance_subagent_round",
+        f"The equilibrium's rating ({result.strength:.2f}) is below the commit "
+        f"threshold ({result.threshold:.2f}) and rounds remain "
+        f"({result.rounds_run}/{result.max_rounds}). Refine it with "
+        "advance_subagent_round(session_id), or accept it now with "
+        "commit_subagent_thought(session_id).",
+    )
+
+
+def subagent_thought_begun(session: Session, result: SubagentRoundResult) -> dict[str, Any]:
+    next_tool, message = _subagent_next_step(result)
+    return {
+        "session_id": session.id,
+        "stage": session.current_stage,
+        **_subagent_round_common(result),
+        "next_tool": next_tool,
+        "message": "Subagent thought started. " + message,
+    }
+
+
+def subagent_round_advanced(session: Session, result: SubagentRoundResult) -> dict[str, Any]:
+    next_tool, message = _subagent_next_step(result)
+    return {
+        "session_id": session.id,
+        "stage": session.current_stage,
+        **_subagent_round_common(result),
+        "next_tool": next_tool,
+        "message": "Round advanced. " + message,
+    }
+
+
+def subagent_matrix(session: Session, state: MatrixState) -> dict[str, Any]:
+    """The current scoring state (inspect_utility_matrix)."""
+    return {
+        "session_id": session.id,
+        "thought_id": state.thought_id,
+        "us_round": state.us_round,
+        "rounds_run": state.rounds_run,
+        "max_rounds": state.max_rounds,
+        "equilibrium_strength": round(state.strength, 3),
+        "commit_threshold": state.threshold,
+        "converged": state.converged,
+        "selected_content": state.selected_content,
+        "candidates": state.candidates,
+        "next_tool": "commit_subagent_thought" if state.converged else "advance_subagent_round",
+        "message": (
+            f"Current equilibrium: {state.rounds_run}/{state.max_rounds} round(s) "
+            f"run, winning candidate rated {state.strength:.2f} (threshold "
+            f"{state.threshold:.2f})."
+        ),
+    }
+
+
+def subagent_thought_committed(session: Session, thought: Thought) -> dict[str, Any]:
+    return {
+        "session_id": session.id,
+        "thought_id": thought.id,
+        "stage": thought.stage,
+        "position": thought.position,
+        "committed": True,
+        "next_tool": "begin_subagent_thought",
+        "message": (
+            f"Subagent thought committed at '{thought.stage}' position "
+            f"{thought.position}. Start another with "
+            "begin_subagent_thought(session_id, content), or move on with "
+            "advance_stage(session_id) when the stage is done."
+        ),
+    }
+
+
+# Per-code directive wording for out-of-order / budget subagent calls. Same
+# shape as `_SERIAL_DIRECTIVES`. (`no_endpoint` is handled separately below --
+# it needs config-pointing wording, not a next tool.)
+_SUBAGENT_DIRECTIVES: dict[str, tuple[str, str]] = {
+    "begin_first": (
+        "begin_subagent_thought",
+        "No subagent thought is in progress. Start one with "
+        "begin_subagent_thought(session_id, content).",
+    ),
+    "uncommitted_exists": (
+        "commit_subagent_thought",
+        "A subagent thought is already in progress. Finish it -- advance or "
+        "accept it with commit_subagent_thought(session_id) -- before "
+        "beginning a new one.",
+    ),
+    "no_rounds": (
+        "begin_subagent_thought",
+        "This thought has no Nash round yet. Start the equilibrium with "
+        "begin_subagent_thought(session_id, content).",
+    ),
+    "round_budget_exhausted": (
+        "commit_subagent_thought",
+        "The subagent round budget (max_rounds) is spent -- US caps it even "
+        "when the Nash core would keep going. Accept the current equilibrium "
+        "with commit_subagent_thought(session_id).",
+    ),
+}
+
+
+def subagent_no_endpoint(session_id: str) -> dict[str, Any]:
+    """No endpoint configured for the NECoRT subagent engine: point the caller
+    at the endpoint-free manual specialist path rather than failing opaquely.
+    """
+    return {
+        "session_id": session_id,
+        "error": "no_endpoint",
+        "next_tool": None,
+        "message": (
+            "Subagent mode has no NECoRT endpoint configured "
+            "([subagent].endpoint / [subagent].endpoints are empty). Either set "
+            "an OpenAI-compatible endpoint in config, or use the endpoint-free "
+            "manual specialist path by setting [subagent] engine=\"manual\" "
+            "(the model plays each specialist itself -- no network)."
+        ),
+    }
+
+
+def subagent_adapter_error(session_id: str, detail: str, retryable: bool) -> dict[str, Any]:
+    """A NECoRT adapter failure (network error, malformed 200 body, vendored
+    core unavailable, ...) surfaced as a directive -- never a raw traceback.
+    """
+    if retryable:
+        message = (
+            "The NECoRT endpoint call failed. This is usually transient (the "
+            "endpoint was unreachable or returned an unexpected body). Retry "
+            "begin_subagent_thought / advance_subagent_round, and if it keeps "
+            f"failing check the [subagent] endpoint/model config. Detail: {detail}"
+        )
+    else:
+        message = (
+            "The NECoRT subagent core is unavailable (its vendored code or its "
+            "dependencies could not be loaded). Use the endpoint-free manual "
+            "specialist path ([subagent] engine=\"manual\") or repair the "
+            f"vendored submodule. Detail: {detail}"
+        )
+    return {
+        "session_id": session_id,
+        "error": "adapter_error",
+        "retryable": retryable,
+        "next_tool": None,
+        "message": message,
+    }
+
+
+def subagent_directive(session_id: str, code: str, **detail: Any) -> dict[str, Any]:
+    """Map a `subagent_engine.SubagentSequencingError` code to a directive
+    payload. `no_endpoint` routes to the manual-path directive; unknown codes
+    degrade to a generic next_action nudge -- a directive is never an error.
+    """
+    if code == "no_endpoint":
+        return subagent_no_endpoint(session_id)
+    next_tool, message = _SUBAGENT_DIRECTIVES.get(
+        code,
+        ("next_action", "Call next_action(session_id) to get the right next step."),
+    )
+    return {
+        "session_id": session_id,
+        "error": "sequencing",
+        "code": code,
+        "next_tool": next_tool,
         "message": message,
     }

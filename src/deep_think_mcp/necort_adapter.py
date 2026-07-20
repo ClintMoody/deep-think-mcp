@@ -7,7 +7,7 @@ project that imports the vendored code; every bit of schema/behaviour drift
 between "what PR #7 does" and "what our schema needs" is absorbed here so no
 other module ever sees the vendored types or their quirks.
 
-Nothing in `vendor/necort/` is modified. All three required shims are applied
+Nothing in `vendor/necort/` is modified. All four required shims are applied
 by subclassing and module-attribute injection only:
 
   1. datetime crash shim. `vendor/necort/nash_recursive_thinking.py` calls
@@ -35,6 +35,28 @@ by subclassing and module-attribute injection only:
      synchronous Nash call onto a worker thread via `asyncio.to_thread`, so it
      never blocks the MCP server's event loop. `run_sync()` remains available
      for synchronous callers (e.g. T14 autopilot).
+
+  4. stdout->stderr `print` shim (T11 hard contract). Both vendored modules
+     (`nash_recursive_thinking` and its base `recursive_thinking_ai`) emit
+     progress via bare `print()` calls -- many unconditional -- straight to
+     stdout. This server speaks MCP JSON-RPC over stdout, so a single stray
+     byte corrupts the transport. `_ensure_loaded()` injects a module-global
+     name `print` into BOTH vendored modules (the same module-attribute
+     technique as the datetime shim); an unqualified `print(...)` inside a
+     function resolves against its *defining module's* globals before the
+     builtin, so this transparently routes every vendored print to stderr
+     without touching a single vendored line. It is set once at load, before
+     any worker thread runs, and is idempotent (identity-guarded).
+
+Round cap (`max_rounds`)
+------------------------
+The vendored `think_and_respond` asks the model how many rounds to run
+(`_determine_thinking_rounds`, 1-5). `NECoRTAdapter(max_rounds=...)` (and the
+per-call `run(..., max_rounds=n)` override) hard-caps that: `ConfigurableNashChat`
+overrides `_determine_thinking_rounds` to return the cap directly, so US -- not
+the model -- decides the round budget (T11 enforces `subagent.max_rounds`), and
+the extra meta round-count API call (and its prints) is skipped entirely. This
+is what lets T11 do honest single-round stepping (`max_rounds=1` per call).
 
 sys.path handling
 -----------------
@@ -104,6 +126,7 @@ Known vendored quirks preserved (not corrected here)
 from __future__ import annotations
 
 import asyncio
+import builtins
 import sys
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -144,6 +167,20 @@ EQ_OUT = "off_equilibrium"  # rated but not part of the equilibrium set
 # Cache of the dynamically built ConfigurableNashChat subclass (also serves as
 # the "already loaded + shimmed" flag so the datetime injection is idempotent).
 _nash_chat_cls: type | None = None
+
+
+def _vendored_print(*args: Any, **kwargs: Any) -> None:
+    """Replacement for the builtin `print`, injected into both vendored
+    modules' globals (shim #4). Forces `file=sys.stderr` so the vendored
+    core's progress output never lands on stdout -- which this MCP server
+    reserves for the JSON-RPC transport. All other `print` kwargs the
+    vendored code passes (`end`, `flush`, ...) are honoured unchanged.
+
+    `sys.stderr` is looked up fresh on every call (not captured at import)
+    so pytest's per-test capture still sees the output.
+    """
+    kwargs["file"] = sys.stderr
+    builtins.print(*args, **kwargs)
 
 
 class NECoRTUnavailable(RuntimeError):
@@ -344,7 +381,7 @@ def _ensure_loaded() -> type:
         sys.path.insert(0, vendor_str)
 
     try:
-        import recursive_thinking_ai  # noqa: F401  (imported for its side effect: sibling resolution)
+        import recursive_thinking_ai as _rta
         import nash_recursive_thinking as _nrt
     except ImportError as exc:  # pragma: no cover - exercised only w/o deps
         raise NECoRTUnavailable(f"could not import vendored NECoRT: {exc}") from exc
@@ -354,6 +391,14 @@ def _ensure_loaded() -> type:
 
     if getattr(_nrt, "datetime", None) is not _datetime:
         _nrt.datetime = _datetime
+
+    # Shim #4: route both vendored modules' bare print()s to stderr, protecting
+    # the MCP stdout transport. Module-global `print` shadows the builtin for
+    # all code defined in that module. Set once at load (before any thread),
+    # identity-guarded so it is idempotent.
+    for _mod in (_rta, _nrt):
+        if getattr(_mod, "print", None) is not _vendored_print:
+            _mod.print = _vendored_print
 
     base = _nrt.NashEquilibriumRecursiveChat
 
@@ -373,6 +418,7 @@ def _ensure_loaded() -> type:
             num_agents: int = 3,
             convergence_threshold: float = 0.05,
             timeout: float = DEFAULT_TIMEOUT,
+            max_rounds: int | None = None,
         ) -> None:
             super().__init__(
                 api_key=api_key,
@@ -383,6 +429,7 @@ def _ensure_loaded() -> type:
             # Replace the base class's hardcoded OpenRouter endpoint/headers.
             self.base_url = base_url
             self._timeout = timeout
+            self._max_rounds = max_rounds
             if headers is not None:
                 self.headers = dict(headers)
             else:
@@ -390,6 +437,17 @@ def _ensure_loaded() -> type:
                 if api_key:
                     resolved["Authorization"] = f"Bearer {api_key}"
                 self.headers = resolved
+
+        def _determine_thinking_rounds(self, prompt: str) -> int:
+            """US round-cap override (see module docstring). When `max_rounds`
+            is set, return it directly -- US, not the model, owns the round
+            budget -- which also skips the base class's extra meta round-count
+            API call (and its prints). Falls back to the vendored behaviour
+            when uncapped.
+            """
+            if self._max_rounds is not None:
+                return max(1, int(self._max_rounds))
+            return super()._determine_thinking_rounds(prompt)
 
         def _call_api(
             self, messages: list, temperature: float = 0.7, stream: bool = True
@@ -435,10 +493,10 @@ class NECoRTAdapter:
     Each `run`/`run_sync` builds a FRESH chat instance, so the vendored
     `conversation_history`/`full_thinking_log` never accumulate across calls
     and concurrent runs share no mutable vendored state (sidestepping recon
-    red-flag #6). Note: the vendored `think_and_respond` still emits progress
-    via `print()` (only `_call_api`'s own output is suppressed here); the MCP
-    server must ensure library stdout does not share its stdio transport --
-    that stdout isolation is a server/T11 concern, out of this adapter's remit.
+    red-flag #6). The vendored `think_and_respond`'s progress `print()`s are
+    routed to stderr by shim #4 (applied at load in `_ensure_loaded`), so
+    driving this adapter never writes to stdout and the MCP JSON-RPC transport
+    stays clean.
     """
 
     def __init__(
@@ -452,6 +510,7 @@ class NECoRTAdapter:
         convergence_threshold: float = 0.05,
         agent_roles: Sequence[str] | None = None,
         timeout: float = DEFAULT_TIMEOUT,
+        max_rounds: int | None = None,
         verbose: bool = False,
     ) -> None:
         self.base_url = base_url
@@ -462,10 +521,11 @@ class NECoRTAdapter:
         self.convergence_threshold = convergence_threshold
         self.agent_roles = list(agent_roles) if agent_roles else None
         self.timeout = timeout
+        self.max_rounds = max_rounds
         self.verbose = verbose
-        _ensure_loaded()  # fail fast + apply the datetime shim
+        _ensure_loaded()  # fail fast + apply the datetime/print shims
 
-    def _new_chat(self):
+    def _new_chat(self, max_rounds: int | None = None):
         cls = _ensure_loaded()
         return cls(
             base_url=self.base_url,
@@ -475,18 +535,21 @@ class NECoRTAdapter:
             num_agents=self.num_agents,
             convergence_threshold=self.convergence_threshold,
             timeout=self.timeout,
+            max_rounds=max_rounds if max_rounds is not None else self.max_rounds,
         )
 
-    def run_sync(self, user_input: str) -> NECoRTResult:
+    def run_sync(self, user_input: str, max_rounds: int | None = None) -> NECoRTResult:
         """Run one full Nash think-and-respond synchronously and translate the
-        result. Blocking; use `run()` from async code.
+        result. Blocking; use `run()` from async code. `max_rounds` overrides
+        the adapter default for this call (T11 passes 1 for single-round
+        stepping); `None` uses the adapter's configured cap (or uncapped).
         """
-        chat = self._new_chat()
+        chat = self._new_chat(max_rounds=max_rounds)
         raw = chat.think_and_respond(user_input, verbose=self.verbose)
         return translate(raw, self.agent_roles)
 
-    async def run(self, user_input: str) -> NECoRTResult:
+    async def run(self, user_input: str, max_rounds: int | None = None) -> NECoRTResult:
         """Async entrypoint (shim #3): offloads the blocking synchronous Nash
         call onto a worker thread so the event loop is never blocked.
         """
-        return await asyncio.to_thread(self.run_sync, user_input)
+        return await asyncio.to_thread(self.run_sync, user_input, max_rounds)

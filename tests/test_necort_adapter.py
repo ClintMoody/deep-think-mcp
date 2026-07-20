@@ -381,3 +381,61 @@ def test_datetime_crash_site_no_longer_raises():
     result = chat.think_and_respond("hi", verbose=False)
     assert "response" in result
     assert calls["n"] > 0
+
+
+# ---------------------------------------------------------------------------
+# 4. stdout-isolation shim (T11 hard contract #1): the vendored code's bare
+# print()s must NOT reach stdout (this MCP server speaks JSON-RPC there).
+# Drive the REAL vendored path against the loopback endpoint and assert
+# capsys saw ZERO bytes on stdout.
+# ---------------------------------------------------------------------------
+
+
+def test_vendored_run_emits_nothing_on_stdout(capsys):
+    _require_vendored()
+    with _RecordingOpenAIServer(content="2") as server:
+        adapter = NECoRTAdapter(
+            base_url=server.base_url, model="local-test-model", num_agents=2
+        )
+        result = adapter.run_sync("does this print?", max_rounds=1)
+
+    captured = capsys.readouterr()
+    assert captured.out == "", f"vendored code leaked to stdout: {captured.out!r}"
+    # The progress banners were not lost -- they were merely rerouted to stderr.
+    assert "NASH EQUILIBRIUM" in captured.err
+    assert isinstance(result, NECoRTResult)
+
+
+def test_print_shim_injected_into_both_vendored_modules():
+    _require_vendored()
+    necort_adapter._ensure_loaded()
+    import nash_recursive_thinking
+    import recursive_thinking_ai
+
+    assert nash_recursive_thinking.print is necort_adapter._vendored_print
+    assert recursive_thinking_ai.print is necort_adapter._vendored_print
+
+
+# ---------------------------------------------------------------------------
+# 5. max_rounds cap (T11 enforces subagent.max_rounds via the adapter arg):
+# a per-call max_rounds hard-caps the Nash round count regardless of what the
+# model's meta round-count call would have wanted.
+# ---------------------------------------------------------------------------
+
+
+def test_max_rounds_caps_thinking_rounds():
+    _require_vendored()
+    # The loopback always answers "2", so _determine_thinking_rounds would
+    # otherwise pick 2 rounds; max_rounds=1 must override that down to one.
+    with _RecordingOpenAIServer(content="2") as server:
+        adapter = NECoRTAdapter(
+            base_url=server.base_url, model="local-test-model", num_agents=2
+        )
+        capped = adapter.run_sync("q", max_rounds=1)
+        uncapped = adapter.run_sync("q")
+
+    assert capped.thinking_rounds == 1
+    # History = round 0 (initial) + exactly one improvement round.
+    assert {r.round_index for r in capped.specialist_rounds} == {0, 1}
+    # Sanity: without the cap the loopback's "2" yields two improvement rounds.
+    assert uncapped.thinking_rounds == 2

@@ -45,11 +45,39 @@ default_lenses = [
 
 [subagent]
 max_rounds = 2
+# equilibrium_threshold is OUR commit-gate criterion, NOT the vendored Nash
+# matrix-diff convergence epsilon (those are different quantities -- see
+# necort_adapter.py's docstring and subagent_engine.py). It is the minimum
+# Nash peer-rating (the populated-dim value, 0..1) the winning candidate must
+# reach for the engine to report the equilibrium as strong enough to commit.
+# It is deliberately compared against the winner's *populated* dim (which
+# carries the real Nash signal), never the 7-dim overall mean -- that mean
+# structurally cannot exceed (3*1.0 + 4*0.5)/7 = 0.714 because 4 of 7 dims are
+# unpopulatable neutral sentinels, so a 0.75 gate on the mean could never pass.
 equilibrium_threshold = 0.75
-# TODO(T9): placeholder pending NECoRT PR #7 recon — replace with the
-# specialist roster PR #7 actually ships once vendored.
-agents = ["Analysis", "Creativity"]
+# The specialist roster (subagent mode). Each name gets a default framing from
+# prompts.SPECIALIST_FRAMINGS; stages.agent_weight_for_stage() weights a
+# specialist higher in its home stage (Analysis in Analysis, Creativity in
+# Synthesis). num_agents passed to the Nash core = len(this list).
+agents = ["Analysis", "Creativity", "Skeptic"]
 sequential_fallback = true
+# Engine for subagent mode: "necort" drives the vendored Nash core against the
+# endpoint(s) below; "manual" (T13) is the endpoint-free path where the calling
+# model plays each specialist itself. When no endpoint is configured, subagent
+# mode directs the caller to the manual path rather than failing opaquely.
+engine = "necort"
+# OpenAI-compatible endpoint(s) for the Nash core. Provide EITHER a single base
+# URL as `endpoint`, OR several as `endpoints = [...]` to fan competing Nash
+# negotiations out concurrently (endpoints wins if both are set). Empty (the
+# default) = NO endpoint configured -> the manual-path directive. The server
+# never contacts these unless a subagent tool is actually invoked.
+endpoint = ""
+endpoints = []
+# Model name and optional bearer token sent to the endpoint above.
+model = "qwen2.5:14b"
+api_key = ""
+# Per-request HTTP timeout (seconds) for the endpoint call.
+timeout = 120.0
 
 [stages]
 default = [
