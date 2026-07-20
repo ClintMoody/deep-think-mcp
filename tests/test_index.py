@@ -105,7 +105,29 @@ def test_reupsert_updates_status_and_leaves_others_alone(tmp_path):
     assert index.get(tmp_path, session_b.id)["status"] == "active"
 
 
-def test_reupsert_bumps_updated_at(tmp_path):
+def test_reupsert_bumps_updated_at(tmp_path, monkeypatch):
+    """F9: step the clock so a distinct timestamp is guaranteed, then assert a
+    STRICT bump. A regression that froze updated_at (or copied created_at)
+    would produce first == second and now FAIL -- which the old `>=` (satisfied
+    by equality) could never catch."""
+    from datetime import datetime, timezone
+
+    ticks = iter(
+        [
+            datetime(2020, 1, 1, 0, 0, 0, tzinfo=timezone.utc),
+            datetime(2020, 1, 1, 0, 0, 5, tzinfo=timezone.utc),
+        ]
+    )
+
+    class _SteppedClock:
+        @staticmethod
+        def now(tz=None):
+            return next(ticks)
+
+    # index.upsert stamps updated_at via `datetime.now(timezone.utc)` (the ONLY
+    # datetime.now call in the module); patch it to a deterministic stepped clock.
+    monkeypatch.setattr(index, "datetime", _SteppedClock)
+
     session = _make_session()
     index.upsert(tmp_path, session)
     first_updated_at = index.get(tmp_path, session.id)["updated_at"]
@@ -114,7 +136,9 @@ def test_reupsert_bumps_updated_at(tmp_path):
     index.upsert(tmp_path, session)
     second_updated_at = index.get(tmp_path, session.id)["updated_at"]
 
-    assert second_updated_at >= first_updated_at
+    assert first_updated_at == "2020-01-01T00:00:00+00:00"
+    assert second_updated_at == "2020-01-01T00:00:05+00:00"
+    assert second_updated_at > first_updated_at
 
 
 # ---------------------------------------------------------------------------

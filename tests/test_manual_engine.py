@@ -119,6 +119,25 @@ def test_advance_walks_roster_then_closes_round():
     assert verdict.metric_label == "mean utility"
 
 
+def test_selection_prefers_higher_mean_over_higher_correctness():
+    """F8: a case where mean-order != correctness-order. A spiky candidate
+    (highest correctness, everything else low) must LOSE to a well-rounded
+    candidate with lower correctness but a higher 7-dim mean. If selection
+    ranked by correctness instead of the mean, 'spiky' would (wrongly) win."""
+    session = _session()
+    cfg = _cfg(agents=["Analysis", "Creativity"])
+    manual_engine.begin(session, "seed", None, cfg)
+    # spec 0: correctness 0.95, other six dims 0.1 -> mean 0.221 (corr winner)
+    manual_engine.advance(session, "spiky", _scores(0.95, other=0.1), cfg)
+    # spec 1: correctness 0.55, other six dims 0.95 -> mean 0.893 (mean winner)
+    verdict = manual_engine.advance(session, "well_rounded", _scores(0.55, other=0.95), cfg)
+
+    assert verdict.selected_content == "well_rounded"  # mean wins, not correctness
+    assert verdict.strength == pytest.approx((0.55 + 6 * 0.95) / 7)
+    thought = session.thoughts[0]
+    assert subagent_engine.selected_round(thought).candidate_content == "well_rounded"
+
+
 def test_selection_is_highest_mean_ties_go_to_first():
     session = _session()
     cfg = _cfg(agents=["Analysis", "Creativity"])
