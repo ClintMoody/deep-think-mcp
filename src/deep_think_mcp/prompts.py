@@ -21,6 +21,7 @@ from typing import TYPE_CHECKING, Any
 from deep_think_mcp.session import Session, Thought
 
 if TYPE_CHECKING:
+    from deep_think_mcp.autopilot import AutopilotOutcome
     from deep_think_mcp.meta import CompressResult, NextAction, SummaryResult
     from deep_think_mcp.serial_engine import CritiquePrompt, ScoreResult
     from deep_think_mcp.subagent_engine import MatrixState, SubagentRoundResult
@@ -1277,4 +1278,269 @@ def subagent_directive(session_id: str, code: str, **detail: Any) -> dict[str, A
         "code": code,
         "next_tool": next_tool,
         "message": message,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Task 14: autopilot (M6). The internal LLM prompt templates (drafting,
+# critiquing-as-lens, refining, scoring, playing a specialist) live HERE with
+# every other template -- `autopilot.py` owns the driving logic, `prompts.py`
+# owns every word, the same division Tasks 7/11/13 established. Each builder
+# returns an OpenAI-style `messages` list; its SYSTEM message opens with a
+# stable phrase identifying the phase.
+# ---------------------------------------------------------------------------
+
+# The 7 utility dimensions the scoring prompt demands, in the exact form
+# `tolerant.parse_scores` -> the engines accept (mirrors serial_engine.DIMENSIONS).
+_AUTOPILOT_DIMENSIONS: tuple[str, ...] = (
+    "correctness",
+    "evidence",
+    "novelty",
+    "clarity",
+    "bias_resistance",
+    "actionability",
+    "coverage",
+)
+
+
+def _prior_block(prior_context: str) -> str:
+    return f"\n\nEstablished context from earlier stages:\n{prior_context}" if prior_context else ""
+
+
+def autopilot_draft_messages(
+    question: str, stage: str, prior_context: str
+) -> list[dict[str, str]]:
+    """Prompt to draft the initial thought for a stage (when no
+    `initial_content` was supplied)."""
+    return [
+        {
+            "role": "system",
+            "content": (
+                "You are an automated reasoning engine drafting the initial thought "
+                "for one stage of a structured deep-think process. Reply with the "
+                "draft prose only -- no preamble, no headings, no meta commentary."
+            ),
+        },
+        {
+            "role": "user",
+            "content": (
+                f"Question:\n{question}\n\nCurrent stage: {stage}."
+                f"{_prior_block(prior_context)}\n\n"
+                "Write the strongest initial draft thought for this stage."
+            ),
+        },
+    ]
+
+
+def autopilot_critique_messages(
+    question: str, stage: str, draft: str, lens_name: str, lens_template: str
+) -> list[dict[str, str]]:
+    """Prompt to critique the current draft through one lens. The lens template
+    (from the discovered library) IS the critique instruction -- reused verbatim,
+    the same text the manual `critique_current_thought` hands the calling model."""
+    return [
+        {
+            "role": "system",
+            "content": (
+                "You are an automated reasoning engine applying a single critique lens "
+                "to a draft thought. Follow the lens instructions exactly and reply "
+                "with the critique only."
+            ),
+        },
+        {
+            "role": "user",
+            "content": (
+                f"{lens_template}\n\n---\nStage: {stage}. Critique lens: {lens_name}.\n"
+                f"Draft thought to critique:\n{draft}\n\n"
+                "Write your critique of the draft above, following the lens instructions."
+            ),
+        },
+    ]
+
+
+def autopilot_refine_messages(
+    question: str, stage: str, draft: str, critique: str
+) -> list[dict[str, str]]:
+    """Prompt to rewrite the draft addressing the critique."""
+    return [
+        {
+            "role": "system",
+            "content": (
+                "You are an automated reasoning engine revising a draft thought to "
+                "address a critique. Reply with the full rewritten thought only -- "
+                "keep what is strong, fix what the critique exposed."
+            ),
+        },
+        {
+            "role": "user",
+            "content": (
+                f"Question:\n{question}\n\nStage: {stage}.\n\n"
+                f"Current draft:\n{draft}\n\nCritique to address:\n{critique}\n\n"
+                "Rewrite the thought to resolve the critique."
+            ),
+        },
+    ]
+
+
+def autopilot_score_messages(content: str) -> list[dict[str, str]]:
+    """Prompt to self-score a thought on the 7 utility dimensions. Demands the
+    exact JSON shape `tolerant.parse_scores` accepts (dimension -> 0..1)."""
+    dims = ", ".join(_AUTOPILOT_DIMENSIONS)
+    example = '{"correctness": 0.8, "evidence": 0.7, "novelty": 0.6, "clarity": 0.8, "bias_resistance": 0.7, "actionability": 0.6, "coverage": 0.7}'
+    return [
+        {
+            "role": "system",
+            "content": (
+                "You are an automated reasoning engine scoring a thought on seven "
+                "utility dimensions. Reply with ONLY a JSON object -- no prose, no "
+                "code fence."
+            ),
+        },
+        {
+            "role": "user",
+            "content": (
+                f"Reasoning to score:\n{content}\n\n"
+                f"Score it on these seven dimensions, each a number from 0.0 to 1.0: "
+                f"{dims}. Respond with ONLY a JSON object mapping each dimension name "
+                f"to its score. For example: {example}"
+            ),
+        },
+    ]
+
+
+def autopilot_specialist_messages(specialist_prompt: str) -> list[dict[str, str]]:
+    """Prompt handing the autopilot one manual specialist's framing to voice.
+    `specialist_prompt` is the exact text `manual_engine` builds (via
+    `build_manual_specialist_prompt`); the autopilot replies with that
+    specialist's candidate thought only (scoring is a separate score call)."""
+    return [
+        {
+            "role": "system",
+            "content": (
+                "You are an automated reasoning engine voicing one specialist "
+                "perspective in a multi-agent deep-think process. Reply with that "
+                "specialist's candidate thought only -- prose, no scores, no preamble."
+            ),
+        },
+        {"role": "user", "content": specialist_prompt},
+    ]
+
+
+# ---- autopilot result / directive payloads ----
+
+
+def stage_autopilot_committed(session: Session, outcome: AutopilotOutcome) -> dict[str, Any]:
+    """`run_stage_autopilot` success: the server drove the serial loop to
+    convergence and committed a thought."""
+    return {
+        "session_id": session.id,
+        "mode": "serial",
+        "autopilot": True,
+        "stage": outcome.stage,
+        "thought_id": outcome.thought_id,
+        "committed": True,
+        "rounds": outcome.rounds,
+        "converged_reason": outcome.converged_reason,
+        "final_content": outcome.final_content,
+        "completed_steps": outcome.completed_steps,
+        "next_tool": "next_action",
+        "message": (
+            f"Autopilot drove the serial critique loop to convergence "
+            f"({outcome.converged_reason}) over {outcome.rounds} round(s) and "
+            f"committed the thought at stage '{outcome.stage}'. Call "
+            "next_action(session_id) for the next step (another thought, "
+            "advance_stage, or finalize_session)."
+        ),
+    }
+
+
+def subagent_autopilot_committed(session: Session, outcome: AutopilotOutcome) -> dict[str, Any]:
+    """`run_subagent_autopilot` success: the server drove the subagent path
+    (necort or manual) to a committed thought."""
+    strength = round(outcome.strength, 3) if outcome.strength is not None else None
+    return {
+        "session_id": session.id,
+        "mode": "subagent",
+        "autopilot": True,
+        "engine": outcome.engine,
+        "stage": outcome.stage,
+        "thought_id": outcome.thought_id,
+        "committed": True,
+        "rounds": outcome.rounds,
+        "equilibrium_strength": strength,
+        "gate_metric": outcome.metric_label,
+        "commit_threshold": outcome.threshold,
+        "converged": outcome.converged,
+        "budget_exhausted": outcome.budget_exhausted,
+        "final_content": outcome.final_content,
+        "completed_steps": outcome.completed_steps,
+        "next_tool": "next_action",
+        "message": (
+            f"Autopilot drove the {outcome.engine} subagent loop over "
+            f"{outcome.rounds} round(s) and committed the winning candidate at "
+            f"stage '{outcome.stage}'. Call next_action(session_id) for the next "
+            "step (another thought, advance_stage, or finalize_session)."
+        ),
+    }
+
+
+def autopilot_stopped(session_id: str, outcome: AutopilotOutcome) -> dict[str, Any]:
+    """Partial-progress directive: autopilot stopped part-way (an endpoint fault
+    or unparseable LLM output). Everything completed so far is already
+    persisted; the caller can resume manually via `next_action`. Never a
+    traceback."""
+    done = ", ".join(outcome.completed_steps) if outcome.completed_steps else "nothing yet"
+    return {
+        "session_id": session_id,
+        "error": "autopilot_incomplete",
+        "retryable": True,
+        "stopped_phase": outcome.stopped_phase,
+        "stopped_detail": outcome.stopped_detail,
+        "completed_steps": outcome.completed_steps,
+        "committed_thought_ids": outcome.committed_thought_ids,
+        "rounds": outcome.rounds,
+        "next_tool": "next_action",
+        "message": (
+            f"Autopilot stopped during the '{outcome.stopped_phase}' step "
+            f"({outcome.stopped_detail}). Progress so far is saved ({done}). "
+            "Continue manually: call next_action(session_id) for the exact next "
+            "tool, or re-run autopilot to retry from here."
+        ),
+    }
+
+
+def autopilot_unavailable(session_id: str) -> dict[str, Any]:
+    """Autopilot is enabled but its optional HTTP dependency (httpx) is missing.
+    A directive pointing at the fix / the manual path -- never a raw ImportError."""
+    return {
+        "session_id": session_id,
+        "error": "autopilot_unavailable",
+        "next_tool": "next_action",
+        "message": (
+            "Autopilot is enabled but its HTTP client dependency (httpx) is not "
+            "installed. Install the optional 'autopilot' extra (e.g. "
+            "`uv sync --extra autopilot`), or drive the loop manually with the "
+            "standard step tools -- next_action(session_id) shows each step."
+        ),
+    }
+
+
+def autopilot_stage_mismatch(
+    session_id: str, requested_stage: str, current_stage: str
+) -> dict[str, Any]:
+    """`run_*_autopilot(stage=...)` named a stage other than the session's
+    current one. Autopilot never silently jumps the stage cursor -- it directs
+    the caller to advance first (or to omit `stage`)."""
+    return {
+        "session_id": session_id,
+        "error": "stage_mismatch",
+        "requested_stage": requested_stage,
+        "current_stage": current_stage,
+        "next_tool": "advance_stage",
+        "message": (
+            f"Autopilot was asked to run stage '{requested_stage}', but this "
+            f"session is at stage '{current_stage}'. Advance to the target stage "
+            "with advance_stage(session_id) first, or omit `stage` to run the "
+            "current one."
+        ),
     }

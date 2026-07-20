@@ -39,6 +39,7 @@ from mcp.server.fastmcp import FastMCP
 from portalocker.exceptions import LockException
 
 from deep_think_mcp import (
+    autopilot,
     config,
     index,
     lens_loader,
@@ -884,6 +885,128 @@ def _register_meta_tools(mcp: FastMCP, data_root: Path) -> None:
         return prompts.session_imported(session, id_reassigned)
 
 
+def _register_autopilot_tools(mcp: FastMCP, data_root: Path) -> None:
+    """Register Task 14's two autopilot tools (Layer 7). Registered ONLY when
+    `[autopilot].enabled=true` (see `create_server`) -- when disabled these are
+    absent from `list_tools` and no network code path is reachable (the httpx
+    import stays lazy inside `autopilot.py`).
+
+    Both are `async def` (they await the OpenAI-compatible endpoint off the
+    event loop) and both are gated by `mode_gate`: `run_stage_autopilot`
+    requires serial mode, `run_subagent_autopilot` requires subagent mode --
+    calling one on the wrong-mode session gets the `wrong_mode` directive, and
+    a no-mode session gets `mode_required`, exactly like the manual tools.
+
+    The DRIVING logic lives in `autopilot.py`; these wrappers only: guard the
+    optional `stage` argument, build the endpoint client (mapping a missing
+    httpx to `autopilot_unavailable`), hand the driver a `persist` closure so
+    every committed thought lands on disk exactly as the manual path does, and
+    map the driver's outcome (or a propagated engine sequencing/adapter error)
+    to `prompts.py` wording -- the same load/mutate/persist division every
+    other engine registration follows.
+    """
+
+    def _persist(session: Session) -> None:
+        store.save(session, session.save_path)
+        index.upsert(data_root, session)
+
+    def _cfg(session: Session) -> dict[str, Any]:
+        return config.load_config(root=data_root, overrides=session.overrides)
+
+    @mcp.tool()
+    @storage_guard
+    @mode_gate(data_root, require_mode="serial")
+    async def run_stage_autopilot(
+        session_id: str,
+        stage: str | None = None,
+        initial_content: str | None = None,
+    ) -> dict[str, Any]:
+        """Autopilot the SERIAL loop for the current stage: the server drafts
+        (from `initial_content` or an LLM draft), then runs critique -> refine
+        -> score rounds against the configured `[autopilot]` endpoint until the
+        convergence rules fire, and commits -- all internally. `stage`, if
+        given, must equal the session's current stage (autopilot never jumps
+        the cursor). Stops with a partial-progress directive (never a
+        traceback) on an endpoint fault or unparseable model output; everything
+        committed so far is persisted and resumable via next_action.
+        """
+        session, error = _load_session(data_root, session_id)
+        if error is not None:
+            return error
+        if stage and stage != session.current_stage:
+            return prompts.autopilot_stage_mismatch(session_id, stage, session.current_stage)
+        cfg = _cfg(session)
+        try:
+            client = autopilot.client_from_cfg(cfg)
+        except autopilot.AutopilotHttpxMissing:
+            return prompts.autopilot_unavailable(session_id)
+        available = lens_loader.discover_lenses(data_root)
+        try:
+            outcome = await autopilot.run_stage(
+                session, cfg, client, available, _persist, initial_content=initial_content
+            )
+        except serial_engine.SerialSequencingError as exc:
+            return prompts.serial_directive(session_id, exc.code, **exc.detail)
+        if outcome.status == "committed":
+            return prompts.stage_autopilot_committed(session, outcome)
+        return prompts.autopilot_stopped(session_id, outcome)
+
+    @mcp.tool()
+    @storage_guard
+    @mode_gate(data_root, require_mode="subagent")
+    async def run_subagent_autopilot(
+        session_id: str,
+        stage: str | None = None,
+        initial_content: str | None = None,
+    ) -> dict[str, Any]:
+        """Autopilot the SUBAGENT loop for the current stage. With
+        `engine="necort"` the server drives the vendored Nash core (via the
+        `[subagent]` endpoint) begin -> advance -> commit; with `engine="manual"`
+        the server plays each specialist itself against the `[autopilot]`
+        endpoint, feeding candidates + 7-dim scores through the same
+        manual_engine functions, then commits the winner. `stage`, if given,
+        must equal the current stage. Endpoint/parse failures on the manual path
+        stop with a partial-progress directive; a missing necort endpoint yields
+        the manual-path directive, never a traceback.
+        """
+        session, error = _load_session(data_root, session_id)
+        if error is not None:
+            return error
+        if stage and stage != session.current_stage:
+            return prompts.autopilot_stage_mismatch(session_id, stage, session.current_stage)
+        cfg = _cfg(session)
+        engine = cfg["subagent"].get("engine", "necort")
+        try:
+            if engine == "manual":
+                try:
+                    client = autopilot.client_from_cfg(cfg)
+                except autopilot.AutopilotHttpxMissing:
+                    return prompts.autopilot_unavailable(session_id)
+                outcome = await autopilot.run_subagent_manual(
+                    session, cfg, client, _persist, initial_content=initial_content
+                )
+            else:
+                outcome = await autopilot.run_subagent_necort(
+                    session, cfg, _persist, initial_content=initial_content
+                )
+        except subagent_engine.SubagentSequencingError as exc:
+            return prompts.subagent_directive(session_id, exc.code, **exc.detail)
+        except subagent_engine.SubagentAdapterError as exc:
+            return prompts.subagent_adapter_error(session_id, exc.detail, exc.retryable)
+        if outcome.status == "committed":
+            return prompts.subagent_autopilot_committed(session, outcome)
+        return prompts.autopilot_stopped(session_id, outcome)
+
+
+def _autopilot_enabled(data_root: Path) -> bool:
+    """Whether `[autopilot].enabled` is true in the effective (packaged + user)
+    config for this data root. Read once at server creation to decide whether
+    the two autopilot tools register at all -- the feature flag's single
+    reachable gate, so with it off no autopilot (and no network) code path is
+    ever registered or callable."""
+    return bool(config.load_config(root=data_root).get("autopilot", {}).get("enabled", False))
+
+
 def create_server(root: Path | str | None = None) -> FastMCP:
     """Build a fresh `deep-think-mcp` FastMCP server instance.
 
@@ -891,6 +1014,10 @@ def create_server(root: Path | str | None = None) -> FastMCP:
     operates against; defaults to `config.resolve_root()`. Tests always
     pass an explicit tmp root (Global Constraints: never touch the real
     home directory); the real entrypoint (`main()`) lets it default.
+
+    The two autopilot tools (Layer 7) register ONLY when `[autopilot].enabled`
+    is true for this root -- otherwise they are absent from `list_tools` and no
+    network code path is reachable.
     """
     data_root = Path(root).expanduser().resolve() if root is not None else config.resolve_root()
     mcp = FastMCP(SERVER_NAME)
@@ -899,6 +1026,8 @@ def create_server(root: Path | str | None = None) -> FastMCP:
     _register_serial_tools(mcp, data_root)
     _register_subagent_tools(mcp, data_root)
     _register_meta_tools(mcp, data_root)
+    if _autopilot_enabled(data_root):
+        _register_autopilot_tools(mcp, data_root)
     return mcp
 
 
