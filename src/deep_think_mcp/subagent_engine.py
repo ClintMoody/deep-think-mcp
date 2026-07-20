@@ -320,6 +320,23 @@ def _append_rounds(thought: Thought, result: NECoRTResult) -> None:
     accumulated history reads as one continuous progression. Each appended
     run keeps its own single `was_selected` winner (used to count US rounds).
     """
+    # [task 13 hardening #5] Assert the exactly-one-winner invariant at the
+    # engine boundary, BEFORE mutating the thought. US round bookkeeping
+    # (`rounds_run`, `selected_round`, `selected_strength`, `commit`) all
+    # assume each adapter run marks exactly one `was_selected` candidate; a
+    # malformed translation (0 or >1 winners -- e.g. a `final_response_agent`
+    # index that never lands, or duplicated selection) would silently corrupt
+    # the round count and the committed content. Checking the batch before it
+    # touches the thought means a violation raises a clean directive
+    # (SubagentAdapterError -> not-a-traceback) and leaves the session
+    # untouched, rather than persisting a broken equilibrium.
+    winners = sum(1 for r in result.specialist_rounds if r.was_selected)
+    if winners != 1:
+        raise SubagentAdapterError(
+            f"equilibrium selected {winners} winning candidates, expected "
+            "exactly 1 -- the Nash result is malformed",
+            retryable=False,
+        )
     existing = thought.specialist_rounds
     offset = (max(r.round_index for r in existing) + 1) if existing else 0
     for rnd in result.specialist_rounds:

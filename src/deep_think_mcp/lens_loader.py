@@ -52,7 +52,16 @@ def _read_lens_dir(directory: Path) -> dict[str, str]:
     """
     if not directory.is_dir():
         return {}
-    return {path.stem: path.read_text() for path in sorted(directory.glob("*.md"))}
+    # [task 13 hardening #7] Pin encoding="utf-8": lens templates are UTF-8
+    # (em-dashes, curly quotes, arrows appear in the bundled `.md` files), but
+    # `Path.read_text()` with no encoding follows the platform locale, so a
+    # server started under a non-UTF-8 `LC_*`/`PYTHONUTF8=0` would raise
+    # `UnicodeDecodeError` reading a perfectly valid lens. Reading is
+    # deterministic regardless of the host's locale now.
+    return {
+        path.stem: path.read_text(encoding="utf-8")
+        for path in sorted(directory.glob("*.md"))
+    }
 
 
 def discover_lenses(root: Path | str | None = None) -> dict[str, str]:

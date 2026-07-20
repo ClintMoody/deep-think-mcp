@@ -38,11 +38,12 @@ from __future__ import annotations
 
 import json
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from typing import Any
 
 from pydantic import ValidationError
 
-from deep_think_mcp import serial_engine, stages, subagent_engine
+from deep_think_mcp import manual_engine, serial_engine, stages, subagent_engine
 from deep_think_mcp.session import Session, Thought
 
 # ---------------------------------------------------------------------------
@@ -90,10 +91,27 @@ def _has_post_finalize_decision(session: Session) -> bool:
         return bool(session.move_history) or any(
             d.action == "keep_here" for d in session.decisions
         )
-    cutoff = session.finalized_at
-    return any(m.timestamp >= cutoff for m in session.move_history) or any(
-        d.action == "keep_here" and d.timestamp >= cutoff for d in session.decisions
+    # [task 13 hardening #3] Normalize every timestamp to a tz-aware UTC value
+    # before comparing. `finalized_at` and the audit timestamps are written
+    # tz-aware (`session.py`'s `_utcnow()`), but a hand-edited or older
+    # imported session can carry NAIVE datetimes -- and comparing a naive to
+    # an aware datetime raises `TypeError: can't compare offset-naive and
+    # offset-aware datetimes`, which would crash `next_action` (an always-safe
+    # tool) on such a session. Treating a naive timestamp as UTC is the honest
+    # normalization: every timestamp this codebase writes IS UTC.
+    cutoff = _to_utc(session.finalized_at)
+    return any(_to_utc(m.timestamp) >= cutoff for m in session.move_history) or any(
+        d.action == "keep_here" and _to_utc(d.timestamp) >= cutoff
+        for d in session.decisions
     )
+
+
+def _to_utc(value: datetime) -> datetime:
+    """Coerce `value` to a tz-aware UTC datetime, treating a naive input as
+    already-UTC (see `_has_post_finalize_decision`'s comment for why)."""
+    if value.tzinfo is None:
+        return value.replace(tzinfo=timezone.utc)
+    return value.astimezone(timezone.utc)
 
 
 def next_action(session: Session, cfg: dict[str, Any]) -> NextAction:
@@ -207,12 +225,20 @@ def next_action(session: Session, cfg: dict[str, Any]) -> NextAction:
 
 
 def _subagent_next_action(session: Session, cfg: dict[str, Any]) -> NextAction:
-    """The subagent-mode active-session rows (T11), mirroring the serial loop's
-    shape. Reads the engine's `loop_state` rather than re-deriving equilibrium
-    state -- the one seam, exactly as the serial branch calls through
-    `serial_engine.loop_phase` / `evaluate_convergence`.
+    """The subagent-mode active-session rows (T11 + T13 manual), mirroring the
+    serial loop's shape. Reads the engine's `loop_state` rather than
+    re-deriving equilibrium state -- the one seam, exactly as the serial branch
+    calls through `serial_engine.loop_phase` / `evaluate_convergence`.
+
+    Which engine's `loop_state` is authoritative depends on config
+    `[subagent].engine` (T13): "manual" reads `manual_engine.loop_state`
+    (which adds the manual-only "awaiting_specialist" state), otherwise the
+    necort `subagent_engine.loop_state`.
     """
-    state = subagent_engine.loop_state(session, cfg)
+    if cfg.get("subagent", {}).get("engine", "necort") == "manual":
+        state = manual_engine.loop_state(session, cfg)
+    else:
+        state = subagent_engine.loop_state(session, cfg)
 
     if state == "no_thought":
         if stages.is_final_stage(session):
@@ -222,6 +248,9 @@ def _subagent_next_action(session: Session, cfg: dict[str, Any]) -> NextAction:
             "begin_subagent_thought",
             {"alternative_tool": "advance_stage"},
         )
+    if state == "awaiting_specialist":
+        # Manual mode only: the model owes the current specialist's candidate.
+        return NextAction("subagent_awaiting_specialist", "advance_subagent_round")
     if state == "converged":
         return NextAction("subagent_converged", "commit_subagent_thought")
     if state == "budget_exhausted":

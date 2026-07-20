@@ -214,6 +214,66 @@ def session_not_found(session_id: str) -> dict[str, Any]:
 
 
 # ---------------------------------------------------------------------------
+# Task 13: tolerant-input + storage-fault directives. Every tool accepts JSON
+# or plaintext for its structured params (tolerant.py); a value that can't be
+# parsed returns THIS directive -- naming the exact expected shape + an
+# example -- rather than a raw error/traceback or a silent default.
+# ---------------------------------------------------------------------------
+
+
+def retry_with_clarification(
+    param: str,
+    expected: str,
+    example: str,
+    *,
+    session_id: str | None = None,
+    next_tool: str | None = None,
+) -> dict[str, Any]:
+    """The `retry_with_clarification` template Global Constraints mandates for
+    malformed tool input. Directive, not an error: it names the parameter, the
+    exact shape expected, and a concrete example, so a weak local model can
+    fix its call and retry in one step.
+    """
+    payload: dict[str, Any] = {
+        "error": "retry_with_clarification",
+        "parameter": param,
+        "expected": expected,
+        "example": example,
+        "message": (
+            f"Could not parse the '{param}' argument. Expected {expected}. "
+            f"For example: {example}. Please call again with '{param}' in "
+            "that form (JSON or the plaintext form shown both work)."
+        ),
+    }
+    if session_id is not None:
+        payload["session_id"] = session_id
+    if next_tool is not None:
+        payload["next_tool"] = next_tool
+    return payload
+
+
+def storage_unavailable(session_id: str | None, detail: str) -> dict[str, Any]:
+    """A persistence step failed with a storage fault -- a Portalocker lock
+    timeout (`LockException`, which is NOT an `OSError` subclass, so it would
+    otherwise escape the OSError-shaped catches) or a raw filesystem error.
+    Surfaced as a retryable directive, never a raw traceback (Task 13
+    hardening item #6).
+    """
+    return {
+        "session_id": session_id,
+        "error": "storage_unavailable",
+        "retryable": True,
+        "next_tool": None,
+        "message": (
+            "The session store was temporarily unavailable (a file lock timed "
+            "out or a filesystem error occurred) and this call was not "
+            "completed. This is usually transient -- retry the same call in a "
+            f"moment. Detail: {detail}"
+        ),
+    }
+
+
+# ---------------------------------------------------------------------------
 # finalize_session() -- Task 4. Wording is the exact canned text from
 # `docs/build-plan.md` § "Finalize + move flow", verbatim per the task
 # brief: the model reads `human_prompt` to the user unmodified.
@@ -626,6 +686,12 @@ _NEXT_ACTION_MESSAGES: dict[str, str] = {
         "remain. Refine it with advance_subagent_round(session_id), or accept "
         "it now with commit_subagent_thought(session_id)."
     ),
+    "subagent_awaiting_specialist": (
+        "This manual subagent round is mid-way: the current specialist owes a "
+        "candidate. Voice it and call advance_subagent_round(session_id, "
+        "candidate=..., scores=...) to submit its candidate and 7-dim "
+        "self-scores."
+    ),
     "loop_zero_rounds": (
         "A thought is drafted but hasn't been critiqued yet. Call "
         "critique_current_thought(session_id)."
@@ -895,6 +961,112 @@ def build_subagent_prompt(
     return "\n".join(parts)
 
 
+# ---------------------------------------------------------------------------
+# Task 13: manual specialist engine ([subagent] engine="manual"). The server
+# hands the calling model one specialist's prompt at a time (the model plays
+# the specialist itself -- no endpoint, no network). `build_manual_specialist_
+# prompt` is the framing text the model applies; `manual_specialist_prompt` is
+# the tool response wrapping it with the directive to produce a candidate +
+# self-scores and call advance_subagent_round.
+# ---------------------------------------------------------------------------
+
+# The 7 utility dimensions the model self-scores each candidate on, in
+# canonical order (mirrors serial_engine.DIMENSIONS). Named here so the manual
+# prompt can spell them out for a weak model without importing the engine.
+_UTILITY_DIMENSIONS: tuple[str, ...] = (
+    "correctness",
+    "evidence",
+    "novelty",
+    "clarity",
+    "bias_resistance",
+    "actionability",
+    "coverage",
+)
+
+
+def build_manual_specialist_prompt(
+    *,
+    question: str,
+    stage: str,
+    prior_context: str,
+    seed_content: str | None,
+    prompt_focus: str | None,
+    specialist_name: str,
+    framing: str,
+    weight: float,
+    specialist_index: int,
+    specialist_total: int,
+    round_num: int,
+) -> str:
+    """The instruction text the model reads to voice one specialist.
+
+    Assembled from the question, the current stage, compressed prior-stage
+    context, the seed to develop (the thought's draft, or the prior round's
+    winning candidate on later rounds), and this specialist's framing with its
+    stage weighting expressed in words (a weak local model can't be handed a
+    real multiplier). The stage-appropriate emphasis comes from
+    `stages.agent_weight_for_stage`, computed by the engine.
+    """
+    emphasis = (
+        f" This is the emphasized perspective for the '{stage}' stage -- lean "
+        "into it especially hard."
+        if weight != 1.0
+        else ""
+    )
+    parts: list[str] = [
+        f"Question under deep-think reasoning:\n{question}",
+        f"\nCurrent reasoning stage: {stage}.",
+        f"\nYou are specialist {specialist_index + 1} of {specialist_total} "
+        f"(round {round_num}): {specialist_name}.",
+        f"\nReason from THIS specialist's perspective:\n{framing}{emphasis}",
+    ]
+    if prior_context:
+        parts.append(f"\nEstablished context from earlier stages:\n{prior_context}")
+    if seed_content:
+        parts.append(f"\nDevelop / improve this current best synthesis:\n{seed_content}")
+    if prompt_focus:
+        parts.append(f"\nFocus this thought specifically on: {prompt_focus}")
+    dims = ", ".join(_UTILITY_DIMENSIONS)
+    parts.append(
+        "\nProduce this specialist's strongest candidate thought for this "
+        "stage, then self-score it on all 7 utility dimensions (0.0-1.0 each): "
+        f"{dims}. Submit both by calling advance_subagent_round(session_id, "
+        'candidate="<your candidate>", scores={"correctness": 0.8, ...}).'
+    )
+    return "\n".join(parts)
+
+
+def manual_specialist_prompt(session: Session, prompt: Any) -> dict[str, Any]:
+    """The tool response handing the model the next specialist to voice
+    (a `manual_engine.ManualPrompt`). Directive: produce the candidate + 7-dim
+    self-scores, then call advance_subagent_round to submit them.
+    """
+    return {
+        "session_id": session.id,
+        "thought_id": prompt.thought_id,
+        "stage": session.current_stage,
+        "engine": "manual",
+        "us_round": prompt.us_round,
+        "rounds_run": prompt.rounds_run,
+        "max_rounds": prompt.max_rounds,
+        "specialist": prompt.specialist_name,
+        "specialist_index": prompt.specialist_index,
+        "specialist_total": prompt.specialist_total,
+        "stage_weight": prompt.weight,
+        "utility_dimensions": list(_UTILITY_DIMENSIONS),
+        "specialist_prompt": prompt.prompt_text,
+        "next_tool": "advance_subagent_round",
+        "message": (
+            f"You are playing specialist {prompt.specialist_index + 1} of "
+            f"{prompt.specialist_total} ({prompt.specialist_name}). Read "
+            "`specialist_prompt`, produce that specialist's candidate thought, "
+            "self-score it on the 7 utility dimensions, then call "
+            "advance_subagent_round(session_id, candidate=..., scores=...) to "
+            "submit it and get the next specialist (or the round result)."
+        ),
+    }
+
+
 def _subagent_round_common(result: SubagentRoundResult) -> dict[str, Any]:
     """The fields common to both begin/advance success payloads."""
     return {
@@ -1025,6 +1197,13 @@ _SUBAGENT_DIRECTIVES: dict[str, tuple[str, str]] = {
         "The subagent round budget (max_rounds) is spent -- US caps it even "
         "when the Nash core would keep going. Accept the current equilibrium "
         "with commit_subagent_thought(session_id).",
+    ),
+    # [task 13] manual engine: the model owes the current specialist's candidate.
+    "need_candidate": (
+        "advance_subagent_round",
+        "This specialist hasn't produced a candidate yet. Voice the current "
+        "specialist, then call advance_subagent_round(session_id, "
+        "candidate=..., scores=...) with its candidate and 7-dim self-scores.",
     ),
 }
 

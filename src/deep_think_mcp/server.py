@@ -36,20 +36,24 @@ from pathlib import Path
 from typing import Any, Callable, Literal
 
 from mcp.server.fastmcp import FastMCP
+from portalocker.exceptions import LockException
 
 from deep_think_mcp import (
     config,
     index,
     lens_loader,
     lifecycle,
+    manual_engine,
     meta,
     prompts,
     serial_engine,
     stages,
     store,
     subagent_engine,
+    tolerant,
 )
 from deep_think_mcp.session import Session
+from deep_think_mcp.tolerant import TolerantParseError
 
 SERVER_NAME = "deep-think-mcp"
 
@@ -163,6 +167,78 @@ def mode_gate(
     return decorator
 
 
+def storage_guard(
+    fn: Callable[..., Any],
+) -> Callable[..., Any]:
+    """Tool-boundary decorator turning a storage fault into a directive.
+
+    Task 13 hardening item #6: the `.bak`-protocol persistence layer
+    (`store.py`, `index.py`) guards every mutation with a Portalocker lock,
+    and a lock that can't be acquired within its timeout raises
+    `portalocker.exceptions.LockException` -- which is NOT an `OSError`
+    subclass. The existing per-tool catches are all shaped for `OSError`
+    (or `lifecycle.MoveError`), so a lock timeout in `finalize` / `keep_here`
+    / `clear` / `import` / a `move`'s internal `store.save`, or in any
+    engine tool's persist step, would escape as a raw traceback -- exactly
+    what the local-model directive design forbids. This wraps a tool so any
+    `LockException` (or bare `OSError`) that reaches the boundary degrades to
+    a clean, retryable `storage_unavailable` directive instead.
+
+    Stacked OUTSIDE `mode_gate` (so it also catches faults in the gate's own
+    session load) and BELOW `@mcp.tool()` (so FastMCP still introspects the
+    real signature via the `functools.wraps` `__wrapped__` chain, same
+    mechanism `mode_gate` relies on). Errors a tool already handles and
+    returns as a payload are untouched -- only a genuinely-escaped storage
+    fault is caught here.
+    """
+
+    def _session_id(args: tuple[Any, ...], kwargs: dict[str, Any]) -> str | None:
+        if "session_id" in kwargs:
+            return kwargs["session_id"]
+        if args and isinstance(args[0], str):
+            return args[0]
+        return None
+
+    if asyncio.iscoroutinefunction(fn):
+
+        @functools.wraps(fn)
+        async def async_wrapper(*args: Any, **kwargs: Any) -> dict[str, Any]:
+            try:
+                return await fn(*args, **kwargs)
+            except (LockException, OSError) as exc:
+                return prompts.storage_unavailable(
+                    _session_id(args, kwargs), f"{type(exc).__name__}: {exc}"
+                )
+
+        return async_wrapper
+
+    @functools.wraps(fn)
+    def wrapper(*args: Any, **kwargs: Any) -> dict[str, Any]:
+        try:
+            return fn(*args, **kwargs)
+        except (LockException, OSError) as exc:
+            return prompts.storage_unavailable(
+                _session_id(args, kwargs), f"{type(exc).__name__}: {exc}"
+            )
+
+    return wrapper
+
+
+def _clarify(
+    exc: TolerantParseError,
+    *,
+    session_id: str | None = None,
+    next_tool: str | None = None,
+) -> dict[str, Any]:
+    """Map a `tolerant.TolerantParseError` to the `retry_with_clarification`
+    directive -- the single boundary translation for every tolerant-parse
+    failure across the tool surface (Task 13 Half A).
+    """
+    return prompts.retry_with_clarification(
+        exc.param, exc.expected, exc.example, session_id=session_id, next_tool=next_tool
+    )
+
+
 def _register_lifecycle_tools(mcp: FastMCP, data_root: Path) -> None:
     """Register the nine session-lifecycle tools: the six from
     `docs/execution-plan.md` Task 3, plus Task 4's finalize/move/keep-here
@@ -174,19 +250,42 @@ def _register_lifecycle_tools(mcp: FastMCP, data_root: Path) -> None:
     """
 
     @mcp.tool()
+    @storage_guard
     def start_session(
         question: str,
         mode: Literal["serial", "subagent"] | None = None,
-        stages: list[str] | None = None,
-        overrides: dict[str, Any] | None = None,
+        stages: list[str] | str | None = None,
+        overrides: dict[str, Any] | str | None = None,
     ) -> dict[str, Any]:
         """Create a new session. Bootstraps the data store on first use.
 
         Without `mode`, returns a mode-required directive payload. With a
         valid `mode`, the session is created with that mode already set and
         the tool proceeds immediately -- no separate `set_session_mode`
-        call needed.
+        call needed. `stages` accepts a JSON array or a comma/newline
+        list; `overrides` a JSON object or its string form (tolerant input,
+        Task 13).
         """
+        try:
+            stages = tolerant.parse_string_list(stages, param="stages")
+            overrides = tolerant.parse_json_or_text(overrides, param="overrides")
+        except TolerantParseError as exc:
+            return _clarify(exc, next_tool="start_session")
+        # [task 13 hardening #4] Reject duplicate custom stage names: stage
+        # names key the position/cursor logic (stages.advance, per-stage
+        # thought positions), so a duplicate would make "which stage are we in"
+        # ambiguous. Caught here at the boundary with a retry_with_clarification
+        # rather than corrupting the session's stage machine.
+        if stages:
+            dupes = sorted({s for s in stages if stages.count(s) > 1})
+            if dupes:
+                return prompts.retry_with_clarification(
+                    "stages",
+                    expected="a list of UNIQUE stage names",
+                    example='["Problem Definition", "Analysis", "Conclusion"]',
+                    next_tool="start_session",
+                )
+
         config.bootstrap(data_root)
         cfg = config.load_config(root=data_root, overrides=overrides)
         expected_stages = list(stages) if stages else list(cfg["stages"]["default"])
@@ -207,6 +306,7 @@ def _register_lifecycle_tools(mcp: FastMCP, data_root: Path) -> None:
         return prompts.session_started(session)
 
     @mcp.tool()
+    @storage_guard
     def set_session_mode(
         session_id: str, mode: Literal["serial", "subagent"]
     ) -> dict[str, Any]:
@@ -216,6 +316,17 @@ def _register_lifecycle_tools(mcp: FastMCP, data_root: Path) -> None:
         session, error = _load_session(data_root, session_id)
         if error is not None:
             return error
+        # [task 13 hardening #2] The load-check-mutate-save below is not atomic
+        # across the two Portalocker acquisitions (`_load_session`'s read, then
+        # `store.save`'s write), so in principle two truly-concurrent
+        # set_session_mode calls could both observe `mode is None` and race.
+        # This is documented as an ACCEPTED single-client limitation, not
+        # code-defended: deep-think-mcp speaks MCP over a stdio transport, which
+        # is one client per server process issuing strictly serialized tool
+        # calls -- there is no concurrent second caller to race against. A true
+        # fix (holding one lock across read+write) would mean threading a
+        # session-scoped lock through store.py for a race that the transport
+        # model already precludes. See .superpowers/sdd/task-13-report.md.
         if session.mode is not None:
             return prompts.mode_already_set(session_id, session.mode)
 
@@ -225,6 +336,7 @@ def _register_lifecycle_tools(mcp: FastMCP, data_root: Path) -> None:
         return prompts.mode_set(session)
 
     @mcp.tool()
+    @storage_guard
     def list_modes() -> dict[str, Any]:
         """Return both modes' descriptions + recommendations, for the
         model to relay to the user.
@@ -232,6 +344,7 @@ def _register_lifecycle_tools(mcp: FastMCP, data_root: Path) -> None:
         return prompts.list_modes()
 
     @mcp.tool()
+    @storage_guard
     def resume_session(session_id: str) -> dict[str, Any]:
         """Return a session's persisted state."""
         session, error = _load_session(data_root, session_id)
@@ -240,11 +353,13 @@ def _register_lifecycle_tools(mcp: FastMCP, data_root: Path) -> None:
         return prompts.session_resumed(session)
 
     @mcp.tool()
+    @storage_guard
     def list_sessions() -> dict[str, Any]:
         """List every session in the index."""
         return prompts.session_list(index.list_all(data_root))
 
     @mcp.tool()
+    @storage_guard
     def clear_session(session_id: str) -> dict[str, Any]:
         """Wipe a session: deletes its file and removes it from the index."""
         entry = index.get(data_root, session_id)
@@ -255,6 +370,7 @@ def _register_lifecycle_tools(mcp: FastMCP, data_root: Path) -> None:
         return prompts.session_cleared(session_id)
 
     @mcp.tool()
+    @storage_guard
     def finalize_session(session_id: str) -> dict[str, Any]:
         """Mark a session finalized. Returns the finalize+move payload:
         where the session is saved, the canned human_prompt asking whether
@@ -271,15 +387,23 @@ def _register_lifecycle_tools(mcp: FastMCP, data_root: Path) -> None:
         return prompts.session_finalized(session, uncommitted_thought=uncommitted)
 
     @mcp.tool()
-    def move_session(session_id: str, new_path: str, force: bool = False) -> dict[str, Any]:
+    @storage_guard
+    def move_session(
+        session_id: str, new_path: str, force: bool | str | None = False
+    ) -> dict[str, Any]:
         """Move a session's file to `new_path`.
 
         `new_path` must be an absolute path (`~` is expanded). If it names
         an existing directory, the session moves into that directory under
         its current filename. Fails cleanly -- without touching the
         session or the filesystem -- if the destination already exists
-        (unless `force=true`), isn't writable, or doesn't exist.
+        (unless `force=true`), isn't writable, or doesn't exist. `force`
+        accepts a real bool or a word ("true"/"yes"/...) -- tolerant input.
         """
+        try:
+            force = bool(tolerant.parse_bool(force, param="force"))
+        except TolerantParseError as exc:
+            return _clarify(exc, session_id=session_id, next_tool="move_session")
         session, error = _load_session(data_root, session_id)
         if error is not None:
             return error
@@ -304,6 +428,7 @@ def _register_lifecycle_tools(mcp: FastMCP, data_root: Path) -> None:
         return prompts.session_moved(session)
 
     @mcp.tool()
+    @storage_guard
     def keep_here(session_id: str) -> dict[str, Any]:
         """Record that the user declined to move the session. No
         filesystem change.
@@ -333,6 +458,7 @@ def _register_stage_tools(mcp: FastMCP, data_root: Path) -> None:
     """
 
     @mcp.tool()
+    @storage_guard
     @mode_gate(data_root)
     def advance_stage(session_id: str) -> dict[str, Any]:
         """Advance the session's stage cursor to the next stage in its
@@ -372,19 +498,26 @@ def _register_serial_tools(mcp: FastMCP, data_root: Path) -> None:
         return config.load_config(root=data_root, overrides=session.overrides)
 
     @mcp.tool()
+    @storage_guard
     @mode_gate(data_root, require_mode="serial")
     def begin_thought(
         session_id: str,
         content: str,
-        tags: list[str] | None = None,
-        axioms: list[str] | None = None,
+        tags: list[str] | str | None = None,
+        axioms: list[str] | str | None = None,
     ) -> dict[str, Any]:
         """Draft a new thought in the session's current stage. Fails with a
         directive if a thought is already in progress (commit it first).
+        `tags`/`axioms` accept a JSON array or a comma/newline list.
         """
         session, error = _load_session(data_root, session_id)
         if error is not None:
             return error
+        try:
+            tags = tolerant.parse_string_list(tags, param="tags")
+            axioms = tolerant.parse_string_list(axioms, param="axioms")
+        except TolerantParseError as exc:
+            return _clarify(exc, session_id=session_id, next_tool="begin_thought")
         try:
             thought = serial_engine.begin_thought(session, content, tags, axioms)
         except serial_engine.SerialSequencingError as exc:
@@ -393,6 +526,7 @@ def _register_serial_tools(mcp: FastMCP, data_root: Path) -> None:
         return prompts.thought_begun(session, thought)
 
     @mcp.tool()
+    @storage_guard
     @mode_gate(data_root, require_mode="serial")
     def critique_current_thought(
         session_id: str, lens: str | None = None
@@ -416,6 +550,7 @@ def _register_serial_tools(mcp: FastMCP, data_root: Path) -> None:
         return prompts.critique_ready(session_id, prompt)
 
     @mcp.tool()
+    @storage_guard
     @mode_gate(data_root, require_mode="serial")
     def submit_critique(session_id: str, text: str) -> dict[str, Any]:
         """Record the critique produced by applying the current lens."""
@@ -430,18 +565,26 @@ def _register_serial_tools(mcp: FastMCP, data_root: Path) -> None:
         return prompts.critique_submitted(session_id, rnd.round_index, rnd.lens)
 
     @mcp.tool()
+    @storage_guard
     @mode_gate(data_root, require_mode="serial")
     def refine_current_thought(
         session_id: str,
         new_content: str,
-        challenged_assumptions: list[str] | None = None,
+        challenged_assumptions: list[str] | str | None = None,
     ) -> dict[str, Any]:
         """Rewrite the thought to address the critique. The server records
         the new version and its normalized edit distance vs. the prior one.
+        `challenged_assumptions` accepts a JSON array or a comma/newline list.
         """
         session, error = _load_session(data_root, session_id)
         if error is not None:
             return error
+        try:
+            challenged_assumptions = tolerant.parse_string_list(
+                challenged_assumptions, param="challenged_assumptions"
+            )
+        except TolerantParseError as exc:
+            return _clarify(exc, session_id=session_id, next_tool="refine_current_thought")
         try:
             rnd, edit_distance = serial_engine.refine_current_thought(
                 session, new_content, challenged_assumptions
@@ -452,20 +595,26 @@ def _register_serial_tools(mcp: FastMCP, data_root: Path) -> None:
         return prompts.thought_refined(session_id, rnd.round_index, edit_distance)
 
     @mcp.tool()
+    @storage_guard
     @mode_gate(data_root, require_mode="serial")
     def score_current_thought(
-        session_id: str, scores: dict[str, Any] | None = None
+        session_id: str, scores: dict[str, Any] | str | None = None
     ) -> dict[str, Any]:
         """Self-score the refined thought across the 7 utility dimensions
-        (partial input is tolerated -- missing dims carry forward). Returns
-        the convergence verdict: whether to commit or run another lens.
+        (partial input is tolerated -- missing dims carry forward). `scores`
+        accepts a JSON object, fenced JSON, or "correctness: 0.8, ..." text.
+        Returns the convergence verdict: whether to commit or run another lens.
         """
         session, error = _load_session(data_root, session_id)
         if error is not None:
             return error
         try:
+            scores = tolerant.parse_scores(scores, param="scores")
+        except TolerantParseError as exc:
+            return _clarify(exc, session_id=session_id, next_tool="score_current_thought")
+        try:
             result = serial_engine.score_current_thought(
-                session, scores or {}, _cfg(session)
+                session, scores, _cfg(session)
             )
         except serial_engine.SerialSequencingError as exc:
             return prompts.serial_directive(session_id, exc.code, **exc.detail)
@@ -473,6 +622,7 @@ def _register_serial_tools(mcp: FastMCP, data_root: Path) -> None:
         return prompts.thought_scored(session_id, result)
 
     @mcp.tool()
+    @storage_guard
     @mode_gate(data_root, require_mode="serial")
     def commit_thought(session_id: str) -> dict[str, Any]:
         """Lock the current thought (writing its final refined content back
@@ -516,50 +666,84 @@ def _register_subagent_tools(mcp: FastMCP, data_root: Path) -> None:
         return config.load_config(root=data_root, overrides=session.overrides)
 
     @mcp.tool()
+    @storage_guard
     @mode_gate(data_root, require_mode="subagent")
     async def begin_subagent_thought(
         session_id: str,
         content: str | None = None,
         prompt_focus: str | None = None,
     ) -> dict[str, Any]:
-        """Start a subagent thought: run the first Nash equilibrium round via
-        the NECoRT core over the configured specialist framings. Fails with a
-        directive if a thought is already in progress, or -- when no endpoint
-        is configured -- points at the endpoint-free manual specialist path.
+        """Start a subagent thought. With `engine="necort"` this runs the first
+        Nash equilibrium round via the vendored core over the configured
+        specialist framings (needs an endpoint; when none is configured it
+        points at the manual path). With `engine="manual"` (T13) this hands
+        back specialist #1's prompt for the calling model to voice itself --
+        no endpoint, no network, no NECoRT code. Fails with a directive if a
+        thought is already in progress.
         """
         session, error = _load_session(data_root, session_id)
         if error is not None:
             return error
+        cfg = _cfg(session)
         try:
-            result = await subagent_engine.begin(session, content, prompt_focus, _cfg(session))
+            if cfg["subagent"].get("engine", "necort") == "manual":
+                result = manual_engine.begin(session, content, prompt_focus, cfg)
+            else:
+                result = await subagent_engine.begin(session, content, prompt_focus, cfg)
         except subagent_engine.SubagentSequencingError as exc:
             return prompts.subagent_directive(session_id, exc.code, **exc.detail)
         except subagent_engine.SubagentAdapterError as exc:
             return prompts.subagent_adapter_error(session_id, exc.detail, exc.retryable)
         _persist(session)
+        if isinstance(result, manual_engine.ManualPrompt):
+            return prompts.manual_specialist_prompt(session, result)
         return prompts.subagent_thought_begun(session, result)
 
     @mcp.tool()
+    @storage_guard
     @mode_gate(data_root, require_mode="subagent")
-    async def advance_subagent_round(session_id: str) -> dict[str, Any]:
-        """Run the next Nash round, re-seeding the current best candidate. The
-        round budget (`subagent.max_rounds`) is enforced here: once spent, this
-        returns a directive pointing at `commit_subagent_thought` rather than
-        running another round.
+    async def advance_subagent_round(
+        session_id: str,
+        candidate: str | None = None,
+        scores: dict[str, Any] | str | None = None,
+    ) -> dict[str, Any]:
+        """Advance the subagent thought by one step.
+
+        `engine="necort"`: runs the next Nash round, re-seeding the current
+        best candidate (`candidate`/`scores` are ignored). `engine="manual"`
+        (T13): records the current specialist's `candidate` + 7-dim `scores`
+        (tolerant input -- JSON or "correctness: 0.8, ..." text) and hands the
+        next specialist's prompt, or -- when the roster is exhausted -- runs
+        the deterministic selection and returns the round result. Calling with
+        no `candidate` at a round boundary (re)starts the next round's first
+        specialist. The round budget (`subagent.max_rounds`) is enforced here.
         """
         session, error = _load_session(data_root, session_id)
         if error is not None:
             return error
+        cfg = _cfg(session)
         try:
-            result = await subagent_engine.advance(session, _cfg(session))
+            if cfg["subagent"].get("engine", "necort") == "manual":
+                try:
+                    parsed = tolerant.parse_scores(scores, param="scores")
+                except TolerantParseError as exc:
+                    return _clarify(
+                        exc, session_id=session_id, next_tool="advance_subagent_round"
+                    )
+                result = manual_engine.advance(session, candidate, parsed, cfg)
+            else:
+                result = await subagent_engine.advance(session, cfg)
         except subagent_engine.SubagentSequencingError as exc:
             return prompts.subagent_directive(session_id, exc.code, **exc.detail)
         except subagent_engine.SubagentAdapterError as exc:
             return prompts.subagent_adapter_error(session_id, exc.detail, exc.retryable)
         _persist(session)
+        if isinstance(result, manual_engine.ManualPrompt):
+            return prompts.manual_specialist_prompt(session, result)
         return prompts.subagent_round_advanced(session, result)
 
     @mcp.tool()
+    @storage_guard
     @mode_gate(data_root, require_mode="subagent")
     def inspect_utility_matrix(session_id: str) -> dict[str, Any]:
         """Return the current Nash scoring state: the latest round's
@@ -576,6 +760,7 @@ def _register_subagent_tools(mcp: FastMCP, data_root: Path) -> None:
         return prompts.subagent_matrix(session, state)
 
     @mcp.tool()
+    @storage_guard
     @mode_gate(data_root, require_mode="subagent")
     def commit_subagent_thought(session_id: str) -> dict[str, Any]:
         """Accept the current equilibrium: lock the winning candidate as the
@@ -617,6 +802,7 @@ def _register_meta_tools(mcp: FastMCP, data_root: Path) -> None:
         index.upsert(data_root, session)
 
     @mcp.tool()
+    @storage_guard
     def next_action(session_id: str) -> dict[str, Any]:
         """Authoritative resolver: given this session's persisted state and
         mode, return the exact next tool to call and a one-line directive.
@@ -632,6 +818,7 @@ def _register_meta_tools(mcp: FastMCP, data_root: Path) -> None:
         return prompts.next_action_result(session, result)
 
     @mcp.tool()
+    @storage_guard
     def summarize_session(
         session_id: str, scope: Literal["stage", "all"] = "stage"
     ) -> dict[str, Any]:
@@ -647,6 +834,7 @@ def _register_meta_tools(mcp: FastMCP, data_root: Path) -> None:
         return prompts.summary_result(session, result)
 
     @mcp.tool()
+    @storage_guard
     def compress_history(
         session_id: str, target_tokens: int = meta.DEFAULT_TARGET_TOKENS
     ) -> dict[str, Any]:
@@ -664,6 +852,7 @@ def _register_meta_tools(mcp: FastMCP, data_root: Path) -> None:
         return prompts.compression_result(session, result)
 
     @mcp.tool()
+    @storage_guard
     def export_session(session_id: str) -> dict[str, Any]:
         """Return this session's complete state as a JSON-serializable
         dict, suitable for handing straight to `import_session`.
@@ -674,6 +863,7 @@ def _register_meta_tools(mcp: FastMCP, data_root: Path) -> None:
         return prompts.session_exported(session, meta.export_session(session))
 
     @mcp.tool()
+    @storage_guard
     def import_session(data: dict[str, Any] | str) -> dict[str, Any]:
         """Recreate a session from a previous `export_session` payload (a
         dict, or its JSON string form). Validated on the way in. If the

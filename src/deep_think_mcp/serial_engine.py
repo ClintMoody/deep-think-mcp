@@ -419,6 +419,16 @@ def submit_critique(session: Session, text: str) -> CritiqueRound:
     inflight = _inflight_round(thought)
     if inflight is None:
         raise SerialSequencingError("need_critique")
+    # [task 13 hardening #1] Phase guard: `_inflight_round` returns the tail
+    # round whenever it isn't yet complete, which includes the await_refine /
+    # await_score phases -- rounds that ALREADY have a critique. Without this
+    # guard a second submit_critique would silently clobber the critique text
+    # of a round the model has already moved past. Route those to the step the
+    # model actually owes (refine / score) instead, same directive
+    # `commit_thought`/`start_critique` already raise for a pending round.
+    phase = _round_phase(inflight)
+    if phase != "await_critique":
+        raise SerialSequencingError(_pending_code(phase))
     if not text or not text.strip():
         raise SerialSequencingError("empty_critique")
     inflight.critique_text = text
