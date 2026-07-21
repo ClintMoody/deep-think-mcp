@@ -22,7 +22,8 @@
   <a href="#configuration">Configuration</a> ·
   <a href="#tool-surface">Tools</a> ·
   <a href="docs/GUIDE.md">Full Guide</a> ·
-  <a href="docs/wiring.md">Client Wiring</a>
+  <a href="docs/wiring.md">Client Wiring</a> ·
+  <a href="docs/http-transport.md">HTTP Daemon</a>
 </p>
 
 ---
@@ -239,6 +240,8 @@ Copy-pasteable config for **Claude Desktop, Claude Code, Cursor, Continue, and L
 }
 ```
 
+> **Sharing one server between clients (or tools keep vanishing from a long-lived host)?** You can instead run deep-think as a single always-live **Streamable HTTP daemon** that multiple clients reach over a URL (`http://127.0.0.1:8182/mcp`) rather than each spawning its own stdio process. This is also the fix when an agent host intermittently drops the tools from its cached schema. See [`docs/http-transport.md`](docs/http-transport.md).
+
 ---
 
 ## Documentation
@@ -247,6 +250,7 @@ Copy-pasteable config for **Claude Desktop, Claude Code, Cursor, Continue, and L
 |---|---|
 | [`docs/GUIDE.md`](docs/GUIDE.md) | **The complete teaching guide** — concepts, architecture, both modes in depth, full tool/config/directive/data-model references, extension, FAQ, glossary. |
 | [`docs/wiring.md`](docs/wiring.md) | Exact client config for Claude Desktop, Claude Code, Cursor, Continue, LibreChat. |
+| [`docs/http-transport.md`](docs/http-transport.md) | **Running as a Streamable HTTP daemon** — one always-live server shared by multiple clients (e.g. an agent host + a DAG), the systemd unit, security posture, and the fix for hosts that drop stdio tools from a cached schema. |
 | [`docs/evaluation.md`](docs/evaluation.md) | **Agent-runnable A/B/C test** — does driving a model through the tool beat answering directly? Self-contained prompt, rubric, judge instructions, and report template. |
 | [`docs/build-plan.md`](docs/build-plan.md) | The original design document (the "why" behind the architecture). |
 | [`docs/execution-plan.md`](docs/execution-plan.md) | The task-by-task build breakdown with global constraints. |

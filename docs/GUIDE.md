@@ -273,6 +273,12 @@ uv run python -m deep_think_mcp.server
 
 That command speaks MCP over stdin/stdout. You normally don't run it by hand — an MCP client launches it for you.
 
+To run **one shared, always-live server** that several clients reach over a URL (instead of each spawning its own stdio process), launch it as a Streamable HTTP daemon. This is also the fix when a long-lived agent host intermittently drops deep-think's tools from its cached tool schema — see [`docs/http-transport.md`](http-transport.md):
+
+```bash
+python -m deep_think_mcp.server --transport streamable-http --host 127.0.0.1 --port 8182
+```
+
 ### The data root
 
 On first use the server **bootstraps** a data root (default `~/deep-think-mcp/`), creating `sessions/` and `logs/` and seeding `config.toml` from the packaged defaults. Override the location with the `DEEP_THINK_HOME` environment variable, which always wins. Resolution order:
