@@ -29,8 +29,10 @@ tool, not a thought-loop tool, is gated the same way.
 
 from __future__ import annotations
 
+import argparse
 import asyncio
 import functools
+import os
 import re
 import uuid
 from pathlib import Path
@@ -1070,9 +1072,99 @@ def create_server(root: Path | str | None = None) -> FastMCP:
     return mcp
 
 
-def main() -> None:
-    """Stdio entrypoint: `uv run python -m deep_think_mcp.server`."""
-    create_server().run()
+def _env_bool(name: str, default: bool = False) -> bool:
+    """Parse a boolean-ish environment variable (1/true/yes/on)."""
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    return raw.strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
+    """Parse CLI args for the server entrypoint.
+
+    Every flag falls back to a ``DEEP_THINK_MCP_*`` env var so the same
+    binary can be driven from a shell, a systemd unit, or a container without
+    changing the command. Defaults reproduce the historical stdio behaviour.
+    """
+    parser = argparse.ArgumentParser(
+        prog="deep_think_mcp.server",
+        description="Run the deep-think-mcp server over stdio (default) or "
+        "as a long-lived Streamable HTTP daemon.",
+    )
+    parser.add_argument(
+        "--transport",
+        choices=["stdio", "streamable-http", "sse"],
+        default=os.environ.get("DEEP_THINK_MCP_TRANSPORT", "stdio"),
+        help="MCP transport. 'stdio' (default) is one client per process. "
+        "'streamable-http' runs a shared always-live daemon on --host/--port.",
+    )
+    parser.add_argument(
+        "--host",
+        default=os.environ.get("DEEP_THINK_MCP_HOST", "127.0.0.1"),
+        help="Bind host for HTTP transports (default: 127.0.0.1, local-only).",
+    )
+    parser.add_argument(
+        "--port",
+        type=int,
+        default=int(os.environ.get("DEEP_THINK_MCP_PORT", "8182")),
+        help="Bind port for HTTP transports (default: 8182).",
+    )
+    parser.add_argument(
+        "--path",
+        default=os.environ.get("DEEP_THINK_MCP_PATH", "/mcp"),
+        help="Mount path for Streamable HTTP (default: /mcp). A client URL is "
+        "then http://<host>:<port><path>.",
+    )
+    parser.add_argument(
+        "--stateless",
+        action="store_true",
+        default=_env_bool("DEEP_THINK_MCP_STATELESS", False),
+        help="Serve Streamable HTTP without a persistent MCP session "
+        "(easier for one-shot callers like DAG steps). Session STATE is "
+        "unaffected — it always lives on disk keyed by session_id.",
+    )
+    return parser.parse_args(argv)
+
+
+def _configure_transport(server: FastMCP, args: argparse.Namespace) -> str:
+    """Apply CLI args to ``server.settings`` and return the transport name.
+
+    Pure and side-effect-free apart from mutating ``server.settings``, so the
+    wiring can be unit-tested without actually binding a socket.
+    """
+    if args.transport in ("streamable-http", "sse"):
+        server.settings.host = args.host
+        server.settings.port = args.port
+        server.settings.streamable_http_path = args.path
+        server.settings.stateless_http = args.stateless
+    return args.transport
+
+
+def main(argv: list[str] | None = None) -> None:
+    """Entrypoint for ``python -m deep_think_mcp.server``.
+
+    Transport model
+    ---------------
+    * ``stdio`` (default) — one client per server process, tool calls strictly
+      serialized. This is the model deep-think's session code assumes (see the
+      single-client note in ``set_session_mode``): the safest option when a
+      single agent spawns the server itself.
+    * ``streamable-http`` — one long-lived daemon that several clients (e.g. a
+      Hermes agent *and* a Dagu DAG) reach over a stable URL. Because every
+      session's state is persisted to disk under ``config.resolve_root()`` and
+      guarded by ``portalocker`` file locks, keyed by ``session_id``, sharing
+      one daemon is safe as long as callers don't drive the *same* session_id
+      truly concurrently. Run it behind a process supervisor (see
+      ``deploy/deep-think-mcp.service``).
+
+    Backward compatibility: invoked with no arguments this is identical to the
+    previous stdio-only entrypoint.
+    """
+    args = _parse_args(argv)
+    server = create_server()
+    transport = _configure_transport(server, args)
+    server.run(transport=transport)
 
 
 if __name__ == "__main__":
