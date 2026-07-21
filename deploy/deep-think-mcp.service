@@ -1,0 +1,36 @@
+# deep-think-mcp — Streamable HTTP daemon (systemd *user* service)
+#
+# Install:
+#   cp deploy/deep-think-mcp.service ~/.config/systemd/user/
+#   systemctl --user daemon-reload
+#   systemctl --user enable --now deep-think-mcp.service
+#   systemctl --user status deep-think-mcp.service
+#
+# Then point any MCP client at   http://127.0.0.1:8182/mcp
+#
+# Assumptions (edit if your checkout differs):
+#   * repo lives at            %h/PROJECTS/apps/deep-think-mcp
+#   * venv interpreter at      %h/PROJECTS/apps/deep-think-mcp/.venv/bin/python
+#   * shared session store at  %h/deep-think-mcp   (DEEP_THINK_HOME)
+#
+# %h expands to the invoking user's home directory. This is a foreground
+# process (uvicorn blocks), so it is a normal Type=simple service — do NOT add
+# RemainAfterExit here (unlike the qmd unit, whose binary self-daemonizes).
+
+[Unit]
+Description=deep-think-mcp Streamable HTTP MCP daemon
+After=network.target
+
+[Service]
+Type=simple
+Environment=HOME=%h
+# Pin the data root explicitly so every client (Hermes, Dagu, ad-hoc CLI)
+# shares one on-disk session store regardless of how HOME resolves.
+Environment=DEEP_THINK_HOME=%h/deep-think-mcp
+ExecStart=%h/PROJECTS/apps/deep-think-mcp/.venv/bin/python -m deep_think_mcp.server \
+    --transport streamable-http --host 127.0.0.1 --port 8182 --path /mcp
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=default.target
