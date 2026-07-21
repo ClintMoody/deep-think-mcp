@@ -1,5 +1,12 @@
 # Wiring deep-think-mcp into an MCP client
 
+> **Long-lived agent host (Hermes-style gateway, or anything that caches a
+> session's tool schema)?** Do **not** use the stdio snippets below — stdio
+> loses the startup race in those hosts and the tools silently vanish from
+> sessions. Run the always-live HTTP daemon and point the host at its URL
+> instead: see [`http-transport.md`](http-transport.md). That doc also covers
+> verification, orphan cleanup, and full uninstall steps for every client.
+
 deep-think-mcp is a dev-checkout, stdio-transport MCP server: every client
 below launches it the same way,
 

@@ -85,19 +85,11 @@ curl -s -o /dev/null -w '%{http_code}\n' http://127.0.0.1:8182/mcp   # expect 40
 
 ## Wiring a Hermes agent to the daemon
 
-Replace the stdio `command:` block with a `url:` (mirrors how qmd is configured)
-in `~/.hermes/config.yaml`:
+Under `mcp_servers:` in `~/.hermes/config.yaml`, the `deep-think` entry must be
+a `url:` block (mirrors how qmd is configured). This is the **only** correct
+shape for a Hermes wired to the daemon — install exactly this:
 
 ```yaml
-# BEFORE — stdio, spawned per connection (the racy setup)
-  deep-think:
-    command: uv
-    args: [--directory, /home/clintm/PROJECTS/apps/deep-think-mcp, run, python, -m, deep_think_mcp.server]
-    timeout: 120
-    connect_timeout: 60
-    enabled: true
-
-# AFTER — point at the always-live daemon
   deep-think:
     url: http://localhost:8182/mcp
     timeout: 30
@@ -105,14 +97,66 @@ in `~/.hermes/config.yaml`:
     enabled: true
 ```
 
-Then, inside Hermes: `/reload-mcp` (or restart the gateway). The `deep-think`
-tools should now appear on **every** new session.
+If the entry instead has `command: uv` / `args: [--directory, …, run, python,
+-m, deep_think_mcp.server]`, that is the racy per-connection stdio form this
+document exists to replace — delete it and use the `url:` block above. (This
+doc deliberately does not show the stdio form as a yaml block: an automated
+installer once copy-pasted the "BEFORE" example instead of the "AFTER" one.)
 
-Clean up any orphaned stdio processes left by the old approach:
+### Restart every process that caches the MCP config
+
+`/reload-mcp` (or restarting the gateway alone) is **not sufficient**. Any
+long-lived host process that connected while a stdio config was in effect keeps
+that spec cached *in memory* and will keep respawning stdio orphans until it is
+restarted — the config file on disk is only read at spawn/connect time. In a
+typical full Hermes deployment that is three separate services:
 
 ```bash
-pkill -f 'deep_think_mcp.server' ; pkill -f 'mcp_stdio_watchdog.*deep-think'
+systemctl --user restart hermes-gateway.service     # the gateway itself
+systemctl --user restart hermes-dashboard.service   # parent of per-session slash_worker processes, which each cache the config
+systemctl --user restart hermes-webui.service       # caches the MCP spec from its first connect
 ```
+
+Symptom of a missed one: you kill the stdio orphans and identical ones (same
+watchdog `--ppid`) reappear within seconds. Find the culprit with
+`ps -o ppid= -p <watchdog-pid>` and restart that parent.
+
+### Clean up orphaned stdio processes — without killing the daemon
+
+Each stale stdio connection is a three-process stack: an
+`mcp_stdio_watchdog.py` wrapper → `uv` → the stdio `python -m
+deep_think_mcp.server`. Two traps:
+
+- **The obvious pkill kills the daemon too.** `pkill -f 'deep_think_mcp.server'`
+  matches the HTTP daemon's command line as well. The stdio processes' command
+  lines *end* at `deep_think_mcp.server`, while the daemon's continues with
+  `--transport streamable-http`, so anchor the pattern with `$`.
+- **pkill can match your own shell.** A `pkill -f` pattern that appears
+  literally inside your own compound command matches the shell running it
+  (self-kill, exit code 144). Inspect first, then kill; fall back to killing by
+  PID if a pattern misbehaves.
+
+```bash
+pgrep -af 'deep_think|mcp_stdio_watchdog'        # inspect first — note which PID is the daemon
+pkill -f 'deep_think_mcp\.server$'               # stdio servers only ($ excludes the daemon)
+pkill -f 'uv --directory.*deep-think-mcp run'    # their uv parents
+# watchdogs outlive their children — kill them separately (by PID if pkill self-matches):
+pkill -f 'mcp_stdio_watchdog.*deep-think-mcp' || kill <watchdog-pids>
+```
+
+### Verify the install
+
+1. Exactly **one** deep-think process exists, and it is the daemon:
+   `pgrep -af deep_think_mcp.server` → one line, containing
+   `--transport streamable-http`.
+2. The host registered the tools over HTTP — in the Hermes agent log
+   (`~/.hermes/logs/agent.log`):
+   `MCP server 'deep-think' (HTTP): registered 29 tool(s)`.
+   If the line says `(stdio)`, a process is still on the old config — see the
+   restart section above.
+3. No respawns: re-run the `pgrep` after a couple of minutes; still one line.
+   (Transient `keepalive failed, triggering reconnect` log lines *during* the
+   restarts are normal churn; they should stop once everything is restarted.)
 
 ## Wiring a Dagu DAG (or any second client)
 
@@ -155,3 +199,44 @@ Set the Hermes `deep-think` block back to the `command:`/`args:` stdio form,
 `systemctl --user disable --now deep-think-mcp.service`, `/reload-mcp`. No data
 migration is involved — the on-disk session store is identical for both
 transports.
+
+## Uninstalling completely
+
+Rollback (above) keeps deep-think but switches transport. This section removes
+it entirely. Order matters: **clients first, then the daemon, then processes,
+then (optionally) data** — removing the daemon while clients still reference it
+just fills logs with reconnect noise.
+
+1. **Unwire the clients.**
+   - *Hermes:* delete the `deep-think:` block from `mcp_servers:` in
+     `~/.hermes/config.yaml`, then restart every config-caching service (same
+     three-service list as in the install section — the gateway alone is not
+     enough).
+   - *Claude Code:* `claude mcp remove deep-think` (add `--scope user` if it
+     was added at user scope; check with `claude mcp list`).
+   - *Anything else pointed at the URL* (a Dagu DAG, cron jobs): remove the
+     reference — there is no server-side registration to undo.
+
+2. **Remove the daemon.**
+
+   ```bash
+   systemctl --user disable --now deep-think-mcp.service
+   rm ~/.config/systemd/user/deep-think-mcp.service
+   systemctl --user daemon-reload
+   ```
+
+3. **Sweep leftover processes** using the anchored patterns from the cleanup
+   section above (watchdogs, uv parents, stdio servers). After this,
+   `pgrep -af deep_think` should return nothing.
+
+4. **Session data (optional — this is the destructive step).** All thinking
+   sessions live under `config.resolve_root()` — `~/deep-think-mcp` by default,
+   or wherever `DEEP_THINK_HOME` points. Nothing else on the system references
+   it, so keep it if you might reinstall, or `rm -rf` it to remove all session
+   history. The user config (`config.toml`) lives inside the same root and goes
+   with it.
+
+5. **The repo clone** (e.g. `~/PROJECTS/apps/deep-think-mcp`) contains the
+   code, its `.venv`, and nothing runtime-critical once the daemon is gone —
+   delete it last, after confirming step 4, since the daemon unit and any
+   stdio configs point into it.
