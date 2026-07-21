@@ -249,6 +249,7 @@ Copy-pasteable config for **Claude Desktop, Claude Code, Cursor, Continue, and L
 | Document | What it is |
 |---|---|
 | [`docs/GUIDE.md`](docs/GUIDE.md) | **The complete teaching guide** — concepts, architecture, both modes in depth, full tool/config/directive/data-model references, extension, FAQ, glossary. |
+| [`docs/sequence-diagram.html`](docs/sequence-diagram.html) | **Visual walkthrough** — self-contained HTML sequence diagrams of the serial reasoning loop and the subagent branch, tool call by tool call. Open in any browser. |
 | [`docs/wiring.md`](docs/wiring.md) | Exact client config for Claude Desktop, Claude Code, Cursor, Continue, LibreChat. |
 | [`docs/http-transport.md`](docs/http-transport.md) | **Running as a Streamable HTTP daemon** — one always-live server shared by multiple clients (e.g. an agent host + a DAG), the systemd unit, security posture, and the fix for hosts that drop stdio tools from a cached schema. |
 | [`docs/evaluation.md`](docs/evaluation.md) | **Agent-runnable A/B/C test** — does driving a model through the tool beat answering directly? Self-contained prompt, rubric, judge instructions, and report template. |
