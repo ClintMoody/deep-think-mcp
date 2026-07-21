@@ -123,6 +123,32 @@ across processes): one step calls `start_session` and records the returned
 tools. Consider `--stateless` on the daemon if your DAG steps are independent
 one-shot MCP calls.
 
+## Security posture
+
+The HTTP daemon is designed for **local, single-operator use** (the same class
+as a local qmd or llama.cpp server). Specifically:
+
+- **Loopback by default.** It binds `127.0.0.1`, reachable only from the same
+  host. Keep it there unless you have a concrete reason not to.
+- **DNS-rebinding protection is on** (SDK default). The server validates the
+  `Host` and `Origin` headers against a localhost allowlist, so a malicious web
+  page in your browser cannot drive the daemon via rebinding — spoofed `Host`
+  gets `421`, spoofed `Origin` gets `403`. Verified in the test notes below.
+- **No application-layer authentication.** Any process that can reach the
+  socket can call every tool. On a loopback bind that means local processes,
+  which is the intended trust boundary. If you ever bind to a routable
+  interface (`--host 0.0.0.0`/a LAN IP), the server logs a warning, and you
+  MUST put it behind an authenticating reverse proxy **and** widen
+  `allowed_hosts` — otherwise legitimate non-localhost clients are rejected by
+  the rebinding guard anyway (it fails closed).
+- **Concurrency / single-client caveat.** A shared daemon makes deep-think's
+  one documented non-atomic window (`set_session_mode`, load-check-mutate
+  across two lock acquisitions) reachable in principle. In practice it is only
+  hit by two callers driving the *same* `session_id` at the same instant;
+  disk writes are `portalocker`-guarded and a single-inference-slot backend
+  serializes callers, so normal multi-client use (distinct sessions) is safe.
+  Use `--stateless` for independent one-shot callers.
+
 ## Rollback
 
 Set the Hermes `deep-think` block back to the `command:`/`args:` stdio form,

@@ -8,7 +8,11 @@ from __future__ import annotations
 
 from mcp.server.fastmcp import FastMCP
 
-from deep_think_mcp.server import _configure_transport, _parse_args
+from deep_think_mcp.server import (
+    _configure_transport,
+    _is_loopback_host,
+    _parse_args,
+)
 
 
 def test_default_transport_is_stdio():
@@ -67,6 +71,13 @@ def test_stateless_flag():
     server = FastMCP("test")
     _configure_transport(server, args)
     assert server.settings.stateless_http is True
+
+
+def test_loopback_host_detection():
+    for h in ["127.0.0.1", "127.0.0.5", "::1", "[::1]", "localhost", "LOCALHOST"]:
+        assert _is_loopback_host(h) is True, h
+    for h in ["0.0.0.0", "192.168.1.10", "10.0.0.2", "example.com", ""]:
+        assert _is_loopback_host(h) is False, h
 
 
 def test_env_var_fallbacks(monkeypatch):

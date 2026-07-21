@@ -32,6 +32,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import functools
+import logging
 import os
 import re
 import uuid
@@ -1127,6 +1128,32 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     return parser.parse_args(argv)
 
 
+def _is_loopback_host(host: str) -> bool:
+    """True for loopback bind addresses (127.0.0.0/8, ::1, localhost)."""
+    h = (host or "").strip().lower().strip("[]")
+    return h == "localhost" or h == "::1" or h.startswith("127.")
+
+
+def _warn_if_publicly_bound(transport: str, host: str) -> None:
+    """Warn when an HTTP transport binds off-loopback.
+
+    deep-think has no application-layer authentication, and the SDK's built-in
+    DNS-rebinding allowlist only permits localhost hosts — so binding to a
+    routable interface both exposes an unauthenticated server AND will have
+    non-localhost requests rejected until ``allowed_hosts`` is widened. Either
+    way the operator should be doing this deliberately, behind an auth proxy.
+    """
+    if transport in ("streamable-http", "sse") and not _is_loopback_host(host):
+        logging.getLogger("deep_think_mcp.server").warning(
+            "Binding %s transport to non-loopback host %r: deep-think has no "
+            "built-in auth and the SDK DNS-rebinding allowlist is localhost-"
+            "only. Put it behind an authenticating reverse proxy and widen "
+            "allowed_hosts before exposing it off-box.",
+            transport,
+            host,
+        )
+
+
 def _configure_transport(server: FastMCP, args: argparse.Namespace) -> str:
     """Apply CLI args to ``server.settings`` and return the transport name.
 
@@ -1164,6 +1191,7 @@ def main(argv: list[str] | None = None) -> None:
     args = _parse_args(argv)
     server = create_server()
     transport = _configure_transport(server, args)
+    _warn_if_publicly_bound(transport, args.host)
     server.run(transport=transport)
 
 
